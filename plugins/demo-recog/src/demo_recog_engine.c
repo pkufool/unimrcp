@@ -31,12 +31,26 @@
 #include "mpf_activity_detector.h"
 #include "apt_consumer_task.h"
 #include "apt_log.h"
+#include <libwebsockets.h>
+#include <json-c/json.h>
+#include <string.h>
 
 #define RECOG_ENGINE_TASK_NAME "Demo Recog Engine"
 
 typedef struct demo_recog_engine_t demo_recog_engine_t;
 typedef struct demo_recog_channel_t demo_recog_channel_t;
 typedef struct demo_recog_msg_t demo_recog_msg_t;
+typedef struct demo_recog_audio_buffer_t demo_recog_audio_buffer_t;
+
+/** Audio buffer for WebSocket streaming */
+struct demo_recog_audio_buffer_t {
+	/** Ring element */
+	APR_RING_ENTRY(demo_recog_audio_buffer_t) link;
+	/** Audio data */
+	void *data;
+	/** Data size */
+	apr_size_t size;
+};
 
 /** Declaration of recognizer engine methods */
 static apt_bool_t demo_recog_engine_destroy(mrcp_engine_t *engine);
@@ -85,6 +99,10 @@ static const mpf_audio_stream_vtable_t audio_stream_vtable = {
 /** Declaration of demo recognizer engine */
 struct demo_recog_engine_t {
 	apt_consumer_task_t    *task;
+	/** ASR backend configuration */
+	char                   *asr_backend_url;
+	char                   *asr_backend_port;
+	char                   *asr_backend_path;
 };
 
 /** Declaration of demo recognizer channel */
@@ -104,6 +122,20 @@ struct demo_recog_channel_t {
 	mpf_activity_detector_t *detector;
 	/** File to write utterance to */
 	FILE                    *audio_out;
+
+	/** WebSocket connection context */
+	struct lws_context      *ws_context;
+	/** WebSocket connection instance */
+	struct lws              *ws_connection;
+	/** WebSocket connection state */
+	apt_bool_t               ws_connected;
+	/** ASR backend configuration */
+	char                    *asr_backend_url;
+	char                    *asr_backend_port;
+	char                    *asr_backend_path;
+	/** Audio buffering for WebSocket streaming */
+	APR_RING_HEAD(demo_recog_audio_buffer_head_t, demo_recog_audio_buffer_t) audio_queue;
+	apr_thread_mutex_t      *audio_queue_mutex;
 };
 
 typedef enum {
@@ -121,6 +153,18 @@ struct demo_recog_msg_t {
 
 static apt_bool_t demo_recog_msg_signal(demo_recog_msg_type_e type, mrcp_engine_channel_t *channel, mrcp_message_t *request);
 static apt_bool_t demo_recog_msg_process(apt_task_t *task, apt_task_msg_t *msg);
+
+/** WebSocket callback function */
+static int demo_recog_ws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
+
+/** WebSocket helper functions */
+static apt_bool_t demo_recog_ws_connect(demo_recog_channel_t *recog_channel);
+static apt_bool_t demo_recog_ws_disconnect(demo_recog_channel_t *recog_channel);
+static apt_bool_t demo_recog_ws_send_audio(demo_recog_channel_t *recog_channel, const void *data, apr_size_t size);
+static apt_bool_t demo_recog_process_asr_response(demo_recog_channel_t *recog_channel, const char *json_msg);
+
+/** INTERMEDIATE-RESULT event handler */
+static apt_bool_t demo_recog_intermediate_result(demo_recog_channel_t *recog_channel, const char *result_text);
 
 /** Declare this macro to set plugin version */
 MRCP_PLUGIN_VERSION_DECLARE
@@ -142,6 +186,11 @@ MRCP_PLUGIN_DECLARE(mrcp_engine_t*) mrcp_plugin_create(apr_pool_t *pool)
 	apt_task_t *task;
 	apt_task_vtable_t *vtable;
 	apt_task_msg_pool_t *msg_pool;
+
+	/* Set default ASR backend configuration */
+	demo_engine->asr_backend_url = apr_pstrdup(pool, "localhost");
+	demo_engine->asr_backend_port = apr_pstrdup(pool, "8080");
+	demo_engine->asr_backend_path = apr_pstrdup(pool, "/asr");
 
 	msg_pool = apt_task_msg_pool_create_dynamic(sizeof(demo_recog_msg_t),pool);
 	demo_engine->task = apt_consumer_task_create(demo_engine,msg_pool,pool);
@@ -210,6 +259,18 @@ static mrcp_engine_channel_t* demo_recog_engine_channel_create(mrcp_engine_t *en
 	recog_channel->detector = mpf_activity_detector_create(pool);
 	recog_channel->audio_out = NULL;
 
+	/* Initialize WebSocket fields */
+	recog_channel->ws_context = NULL;
+	recog_channel->ws_connection = NULL;
+	recog_channel->ws_connected = FALSE;
+	recog_channel->asr_backend_url = apr_pstrdup(pool, recog_channel->demo_engine->asr_backend_url);
+	recog_channel->asr_backend_port = apr_pstrdup(pool, recog_channel->demo_engine->asr_backend_port);
+	recog_channel->asr_backend_path = apr_pstrdup(pool, recog_channel->demo_engine->asr_backend_path);
+	
+	/* Initialize audio queue */
+	APR_RING_INIT(&recog_channel->audio_queue, demo_recog_audio_buffer_t, link); 
+	apr_thread_mutex_create(&recog_channel->audio_queue_mutex, APR_THREAD_MUTEX_UNNESTED, pool);
+
 	capabilities = mpf_sink_stream_capabilities_create(pool);
 	mpf_codec_capabilities_add(
 			&capabilities->codecs,
@@ -237,7 +298,23 @@ static mrcp_engine_channel_t* demo_recog_engine_channel_create(mrcp_engine_t *en
 /** Destroy engine channel */
 static apt_bool_t demo_recog_channel_destroy(mrcp_engine_channel_t *channel)
 {
-	/* nothing to destrtoy */
+	demo_recog_channel_t *recog_channel = channel->method_obj;
+	
+	/* Cleanup WebSocket connection */
+	if(recog_channel->ws_connected) {
+		demo_recog_ws_disconnect(recog_channel);
+	}
+	
+	/* Cleanup audio queue */
+	if(recog_channel->audio_queue_mutex) {
+		apr_thread_mutex_lock(recog_channel->audio_queue_mutex);
+		while(!APR_RING_EMPTY(&recog_channel->audio_queue, demo_recog_audio_buffer_t, link)) {
+			demo_recog_audio_buffer_t *buffer = APR_RING_FIRST(&recog_channel->audio_queue);
+			APR_RING_REMOVE(buffer, link);
+		}
+		apr_thread_mutex_unlock(recog_channel->audio_queue_mutex);
+	}
+	
 	return TRUE;
 }
 
@@ -311,6 +388,18 @@ static apt_bool_t demo_recog_channel_recognize(mrcp_engine_channel_t *channel, m
 			if(!recog_channel->audio_out) {
 				apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to Open Utterance Output File [%s] for Writing",file_path);
 			}
+		}
+	}
+
+	/* Establish WebSocket connection to ASR backend */
+	if(!recog_channel->ws_connected) {
+		apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Establishing WebSocket connection to ASR backend %s:%s%s",
+			recog_channel->asr_backend_url, recog_channel->asr_backend_port, recog_channel->asr_backend_path);
+		
+		if(!demo_recog_ws_connect(recog_channel)) {
+			apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to connect to ASR backend");
+			response->start_line.status_code = MRCP_STATUS_CODE_METHOD_FAILED;
+			return FALSE;
 		}
 	}
 
@@ -527,6 +616,11 @@ static apt_bool_t demo_recog_stream_write(mpf_audio_stream_t *stream, const mpf_
 		if(recog_channel->audio_out) {
 			fwrite(frame->codec_frame.buffer,1,frame->codec_frame.size,recog_channel->audio_out);
 		}
+		
+		/* Stream audio to WebSocket ASR backend */
+		if(recog_channel->ws_connected && frame->codec_frame.size > 0) {
+			demo_recog_ws_send_audio(recog_channel, frame->codec_frame.buffer, frame->codec_frame.size);
+		}
 	}
 	return TRUE;
 }
@@ -578,4 +672,222 @@ static apt_bool_t demo_recog_msg_process(apt_task_t *task, apt_task_msg_t *msg)
 			break;
 	}
 	return TRUE;
+}
+
+/* WebSocket protocols */
+static const char *ws_protocol_name = "asr-protocol";
+static struct lws_protocols protocols[] = {
+	{
+		.name = "asr-protocol",
+		.callback = demo_recog_ws_callback,
+		.per_session_data_size = sizeof(demo_recog_channel_t*),
+		.rx_buffer_size = 4096,
+	},
+	{ NULL, NULL, 0, 0 } /* terminator */
+};
+
+/** WebSocket callback function */
+static int demo_recog_ws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len)
+{
+	demo_recog_channel_t **channel_ptr = (demo_recog_channel_t**)user;
+	demo_recog_channel_t *recog_channel = (channel_ptr && *channel_ptr) ? *channel_ptr : NULL;
+	
+	switch (reason) {
+		case LWS_CALLBACK_CLIENT_ESTABLISHED:
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "WebSocket connection established");
+			if(recog_channel) {
+				recog_channel->ws_connected = TRUE;
+			}
+			break;
+			
+		case LWS_CALLBACK_CLIENT_RECEIVE:
+			if(recog_channel && in && len > 0) {
+				char *json_msg = apr_palloc(recog_channel->channel->pool, len + 1);
+				memcpy(json_msg, in, len);
+				json_msg[len] = '\0';
+				demo_recog_process_asr_response(recog_channel, json_msg);
+			}
+			break;
+			
+		case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+		case LWS_CALLBACK_CLIENT_CLOSED:
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "WebSocket connection closed/error");
+			if(recog_channel) {
+				recog_channel->ws_connected = FALSE;
+				recog_channel->ws_connection = NULL;
+			}
+			break;
+			
+		case LWS_CALLBACK_CLIENT_WRITEABLE:
+			/* Handle queued audio data */
+			if(recog_channel && recog_channel->audio_queue_mutex) {
+				apr_thread_mutex_lock(recog_channel->audio_queue_mutex);
+				if(!APR_RING_EMPTY(&recog_channel->audio_queue, demo_recog_audio_buffer_t, link)) {
+					demo_recog_audio_buffer_t *buffer = APR_RING_FIRST(&recog_channel->audio_queue);
+					APR_RING_REMOVE(buffer, link);
+					apr_thread_mutex_unlock(recog_channel->audio_queue_mutex);
+					
+					int ret = lws_write(wsi, (unsigned char*)buffer->data, buffer->size, LWS_WRITE_BINARY);
+					if (ret < 0) {
+						apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, "Failed to write audio data to WebSocket");
+						return -1;
+					}
+					lws_callback_on_writable(wsi);
+				} else {
+					apr_thread_mutex_unlock(recog_channel->audio_queue_mutex);
+				}
+			}
+			break;
+			
+		default:
+			break;
+	}
+	
+	return 0;
+}
+
+/** Establish WebSocket connection to ASR backend */
+static apt_bool_t demo_recog_ws_connect(demo_recog_channel_t *recog_channel)
+{
+	struct lws_context_creation_info info;
+	struct lws_client_connect_info connect_info;
+	
+	memset(&info, 0, sizeof(info));
+	info.port = CONTEXT_PORT_NO_LISTEN;  
+	info.protocols = protocols;
+	info.gid = -1;
+	info.uid = -1;
+	
+	recog_channel->ws_context = lws_create_context(&info);
+	if(!recog_channel->ws_context) {
+		apt_log(RECOG_LOG_MARK, APT_PRIO_ERROR, "Failed to create WebSocket context");
+		return FALSE;
+	}
+	
+	memset(&connect_info, 0, sizeof(connect_info));
+	connect_info.context = recog_channel->ws_context;
+	connect_info.address = recog_channel->asr_backend_url;
+	connect_info.port = atoi(recog_channel->asr_backend_port);
+	connect_info.path = recog_channel->asr_backend_path;
+	connect_info.host = recog_channel->asr_backend_url;
+	connect_info.origin = recog_channel->asr_backend_url;
+	connect_info.protocol = ws_protocol_name;
+	connect_info.userdata = &recog_channel;
+	
+	recog_channel->ws_connection = lws_client_connect_via_info(&connect_info);
+	if(!recog_channel->ws_connection) {
+		apt_log(RECOG_LOG_MARK, APT_PRIO_ERROR, "Failed to initiate WebSocket connection");
+		lws_context_destroy(recog_channel->ws_context);
+		recog_channel->ws_context = NULL;
+		return FALSE;
+	}
+	
+	return TRUE;
+}
+
+/** Disconnect WebSocket connection */
+static apt_bool_t demo_recog_ws_disconnect(demo_recog_channel_t *recog_channel)
+{
+	if(recog_channel->ws_connection) {
+		lws_close_free_wsi(recog_channel->ws_connection, LWS_CLOSE_STATUS_NORMAL, "recognition complete");
+		recog_channel->ws_connection = NULL;
+	}
+	
+	if(recog_channel->ws_context) {
+		lws_context_destroy(recog_channel->ws_context);
+		recog_channel->ws_context = NULL;
+	}
+	
+	recog_channel->ws_connected = FALSE;
+	return TRUE;
+}
+
+/** Send audio data to WebSocket */
+static apt_bool_t demo_recog_ws_send_audio(demo_recog_channel_t *recog_channel, const void *data, apr_size_t size)
+{
+	if(!recog_channel->ws_connected || !recog_channel->ws_connection) {
+		return FALSE;
+	}
+	
+	/* Queue audio data for sending */
+	demo_recog_audio_buffer_t *buffer = apr_palloc(recog_channel->channel->pool, sizeof(demo_recog_audio_buffer_t));
+	buffer->data = apr_palloc(recog_channel->channel->pool, size);
+	memcpy(buffer->data, data, size);
+	buffer->size = size;
+	
+	apr_thread_mutex_lock(recog_channel->audio_queue_mutex);
+	APR_RING_INSERT_TAIL(&recog_channel->audio_queue, buffer, demo_recog_audio_buffer_t, link);
+	apr_thread_mutex_unlock(recog_channel->audio_queue_mutex);
+	
+	lws_callback_on_writable(recog_channel->ws_connection);
+	lws_service(recog_channel->ws_context, 0);
+	
+	return TRUE;
+}
+
+/** Process ASR response from WebSocket */
+static apt_bool_t demo_recog_process_asr_response(demo_recog_channel_t *recog_channel, const char *json_msg)
+{
+	json_object *root = json_tokener_parse(json_msg);
+	if(!root) {
+		apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, "Failed to parse JSON response: %s", json_msg);
+		return FALSE;
+	}
+	
+	json_object *type_obj, *result_obj;
+	if(!json_object_object_get_ex(root, "type", &type_obj) ||
+	   !json_object_object_get_ex(root, "result", &result_obj)) {
+		apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, "Invalid ASR response format: %s", json_msg);
+		json_object_put(root);
+		return FALSE;
+	}
+	
+	const char *type_str = json_object_get_string(type_obj);
+	const char *result_str = json_object_get_string(result_obj);
+	
+	if(strcmp(type_str, "partial") == 0) {
+		/* Send INTERMEDIATE-RESULT event */
+		demo_recog_intermediate_result(recog_channel, result_str);
+	} else if(strcmp(type_str, "final") == 0) {
+		/* Send RECOGNITION-COMPLETE event */
+		demo_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
+	}
+	
+	json_object_put(root);
+	return TRUE;
+}
+
+/** Send INTERMEDIATE-RESULT event */
+static apt_bool_t demo_recog_intermediate_result(demo_recog_channel_t *recog_channel, const char *result_text)
+{
+	if(!recog_channel->recog_request) {
+		return FALSE;
+	}
+	
+	/* create INTERMEDIATE-RESULT event */
+	mrcp_message_t *message = mrcp_event_create(
+						recog_channel->recog_request,
+						RECOGNIZER_INTERMEDIATE_RESULT,
+						recog_channel->recog_request->pool);
+	if(!message) {
+		return FALSE;
+	}
+	
+	/* Set the result text as message body */
+	if(result_text && strlen(result_text) > 0) {
+		apt_string_assign(&message->body, result_text, message->pool);
+		
+		/* Set content type for the result */
+		mrcp_generic_header_t *generic_header = mrcp_generic_header_prepare(message);
+		if(generic_header) {
+			apt_string_assign(&generic_header->content_type, "text/plain", message->pool);
+			mrcp_generic_header_property_add(message, GENERIC_HEADER_CONTENT_TYPE);
+		}
+	}
+	
+	/* set request state */
+	message->start_line.request_state = MRCP_REQUEST_STATE_INPROGRESS;
+	
+	/* send asynch event */
+	return mrcp_engine_channel_message_send(recog_channel->channel, message);
 }
