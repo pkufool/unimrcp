@@ -25,6 +25,16 @@
  * 4. Methods (callbacks) of the MRCP engine channel MUST not block.
  *   (asynchronous response can be sent from the context of other thread)
  * 5. Methods (callbacks) of the MPF engine stream MUST not block.
+ * 
+ * STREAMING ASR ENHANCEMENTS:
+ * This demo recognition engine has been enhanced with real-time streaming ASR
+ * capabilities using libwebsockets:
+ * - Establishes WebSocket connections to configurable ASR backends
+ * - Streams audio frames in real-time during recognition
+ * - Supports INTERMEDIATE-RESULT events for partial recognition hypotheses
+ * - Processes JSON responses from ASR backend for partial and final results
+ * - Thread-safe audio buffering using APR ring queues
+ * - Default ASR backend: localhost:8080/asr
  */
 
 #include "mrcp_recog_engine.h"
