@@ -387,3 +387,10 @@
 /tests/strtablegen/Makefile.in
 /tests/strtablegen/Makefile
 /tests/strtablegen/strtablegen
+
+# Additional files for streaming ASR integration
+*.pcm
+*.wav
+__pycache__/
+*.pyc
+build-dir/
