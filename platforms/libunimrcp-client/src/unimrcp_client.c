@@ -35,6 +35,50 @@
 #include "apt_net.h"
 #include "apt_log.h"
 
+/*
+ * Environment Variable Support for MRCP Client Configuration
+ * 
+ * The following configuration values can be overridden using environment variables:
+ * 
+ * SIP Agent Configuration:
+ *   MRCP_CLIENT_SIP_PORT         - SIP port (default: 8062)
+ *   MRCP_CLIENT_SIP_TRANSPORT    - SIP transport protocol (default: from XML)
+ *   MRCP_CLIENT_UA_NAME          - User agent name (default: from XML)
+ *   MRCP_CLIENT_SDP_ORIGIN       - SDP origin (default: from XML)
+ *   MRCP_CLIENT_SIP_T1           - SIP T1 timer (default: from XML)
+ *   MRCP_CLIENT_SIP_T2           - SIP T2 timer (default: from XML)
+ *   MRCP_CLIENT_SIP_T4           - SIP T4 timer (default: from XML)
+ *   MRCP_CLIENT_SIP_T1X64        - SIP T1x64 timer (default: from XML)
+ *   MRCP_CLIENT_SIP_TIMER_C      - SIP Timer C (default: from XML)
+ *   MRCP_CLIENT_SIP_MESSAGE_OUTPUT   - Enable SIP message output (true/false)
+ *   MRCP_CLIENT_SIP_MESSAGE_DUMP     - SIP message dump file path
+ * 
+ * SIP/RTSP Settings:
+ *   MRCP_CLIENT_SERVER_PORT      - Server port (default: from XML)
+ *   MRCP_CLIENT_SERVER_USERNAME  - Server username (default: from XML)
+ *   MRCP_CLIENT_FORCE_DESTINATION - Force destination flag (true/false)
+ *   MRCP_CLIENT_FEATURE_TAGS     - Feature tags (default: from XML)
+ *   MRCP_CLIENT_RESOURCE_LOCATION - Resource location (default: from XML)
+ * 
+ * RTP Factory Configuration:
+ *   MRCP_CLIENT_RTP_PORT_MIN     - RTP port range minimum (default: 4000)
+ *   MRCP_CLIENT_RTP_PORT_MAX     - RTP port range maximum (default: 5000)
+ * 
+ * MRCPv2 Connection Agent:
+ *   MRCP_CLIENT_MAX_CONNECTION_COUNT - Maximum connection count (default: 100)
+ *   MRCP_CLIENT_MAX_SHARED_USE_COUNT - Maximum shared use count (default: 100)
+ *   MRCP_CLIENT_OFFER_NEW_CONNECTION - Offer new connection flag (true/false)
+ *   MRCP_CLIENT_RX_BUFFER_SIZE   - Receive buffer size (default: from XML)
+ *   MRCP_CLIENT_TX_BUFFER_SIZE   - Transmit buffer size (default: from XML)
+ *   MRCP_CLIENT_REQUEST_TIMEOUT  - Request timeout (default: from XML)
+ * 
+ * Media Engine:
+ *   MRCP_CLIENT_REALTIME_RATE    - Realtime rate (default: 1)
+ * 
+ * If an environment variable is set, it takes precedence over the XML configuration.
+ * If neither is set, built-in defaults are used where applicable.
+ */
+
 #define CONF_FILE_NAME            "unimrcpclient.xml"
 
 #define DEFAULT_IP_ADDRESS        "127.0.0.1"
@@ -303,7 +347,74 @@ static char* unimrcp_client_ip_address_get(unimrcp_client_loader_t *loader, cons
 	return apr_pstrdup(loader->pool,loader->ip);
 }
 
+/** Get string configuration value from environment variable first, then XML element */
+static const char* unimrcp_client_config_string_get(const char *env_name, const apr_xml_elem *elem, const char *default_value, apr_pool_t *pool)
+{
+	const char *env_value;
+	
+	/* Check environment variable first */
+	env_value = getenv(env_name);
+	if(env_value && *env_value) {
+		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Using environment variable %s=%s", env_name, env_value);
+		return apr_pstrdup(pool, env_value);
+	}
+	
+	/* Fall back to XML element value */
+	if(is_cdata_valid(elem) == TRUE) {
+		return cdata_copy(elem, pool);
+	}
+	
+	/* Use default value */
+	if(default_value) {
+		return apr_pstrdup(pool, default_value);
+	}
+	
+	return NULL;
+}
 
+/** Get integer configuration value from environment variable first, then XML element */
+static long unimrcp_client_config_int_get(const char *env_name, const apr_xml_elem *elem, long default_value)
+{
+	const char *env_value;
+	
+	/* Check environment variable first */
+	env_value = getenv(env_name);
+	if(env_value && *env_value) {
+		long value = atol(env_value);
+		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Using environment variable %s=%ld", env_name, value);
+		return value;
+	}
+	
+	/* Fall back to XML element value */
+	if(is_cdata_valid(elem) == TRUE) {
+		return atol(cdata_text_get(elem));
+	}
+	
+	/* Use default value */
+	return default_value;
+}
+
+/** Get boolean configuration value from environment variable first, then XML element */
+static apt_bool_t unimrcp_client_config_bool_get(const char *env_name, const apr_xml_elem *elem, apt_bool_t default_value)
+{
+	const char *env_value;
+	
+	/* Check environment variable first */
+	env_value = getenv(env_name);
+	if(env_value && *env_value) {
+		apt_bool_t value = (strcasecmp(env_value, "true") == 0 || strcasecmp(env_value, "1") == 0 || strcasecmp(env_value, "yes") == 0);
+		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Using environment variable %s=%s (bool: %s)", env_name, env_value, value ? "true" : "false");
+		return value;
+	}
+	
+	/* Fall back to XML element value */
+	if(is_cdata_valid(elem) == TRUE) {
+		return cdata_bool_get(elem);
+	}
+	
+	/* Use default value */
+	return default_value;
+}
 
 /** Load resource */
 static apt_bool_t unimrcp_client_resource_load(mrcp_resource_loader_t *resource_loader, const apr_xml_elem *root, apr_pool_t *pool)
@@ -371,17 +482,18 @@ static apt_bool_t unimrcp_client_sip_uac_load(unimrcp_client_loader_t *loader, c
 			config->ext_ip = unimrcp_client_ip_address_get(loader,elem,loader->ext_ip);
 		}
 		else if(strcasecmp(elem->name,"sip-port") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				config->local_port = (apr_port_t)atol(cdata_text_get(elem));
-			}
+			config->local_port = (apr_port_t)unimrcp_client_config_int_get("MRCP_CLIENT_SIP_PORT", elem, DEFAULT_SIP_PORT);
 		}
 		else if(strcasecmp(elem->name,"sip-transport") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				config->transport = cdata_copy(elem,loader->pool);
-			}
+			config->transport = unimrcp_client_config_string_get("MRCP_CLIENT_SIP_TRANSPORT", elem, NULL, loader->pool);
 		}
 		else if(strcasecmp(elem->name,"ua-name") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
+			const char *env_value = getenv("MRCP_CLIENT_UA_NAME");
+			if(env_value && *env_value) {
+				apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Using environment variable MRCP_CLIENT_UA_NAME=%s", env_value);
+				config->user_agent_name = apr_pstrdup(loader->pool, env_value);
+			}
+			else if(is_cdata_valid(elem) == TRUE) {
 				const apr_xml_attr *attr = NULL;
 				for(attr = elem->attr; attr; attr = attr->next) {
 					if(strcasecmp(attr->name,"appendversion") == 0) {
@@ -397,42 +509,33 @@ static apt_bool_t unimrcp_client_sip_uac_load(unimrcp_client_loader_t *loader, c
 			}
 		}
 		else if(strcasecmp(elem->name,"sdp-origin") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				config->origin = cdata_copy(elem,loader->pool);
-			}
+			config->origin = unimrcp_client_config_string_get("MRCP_CLIENT_SDP_ORIGIN", elem, NULL, loader->pool);
 		}
 		else if(strcasecmp(elem->name,"sip-t1") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				config->sip_t1 = atol(cdata_text_get(elem));
-			}
+			config->sip_t1 = unimrcp_client_config_int_get("MRCP_CLIENT_SIP_T1", elem, 0);
 		}
 		else if(strcasecmp(elem->name,"sip-t2") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				config->sip_t2 = atol(cdata_text_get(elem));
-			}
+			config->sip_t2 = unimrcp_client_config_int_get("MRCP_CLIENT_SIP_T2", elem, 0);
 		}
 		else if(strcasecmp(elem->name,"sip-t4") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				config->sip_t4 = atol(cdata_text_get(elem));
-			}
+			config->sip_t4 = unimrcp_client_config_int_get("MRCP_CLIENT_SIP_T4", elem, 0);
 		}
 		else if(strcasecmp(elem->name,"sip-t1x64") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				config->sip_t1x64 = atol(cdata_text_get(elem));
-			}
+			config->sip_t1x64 = unimrcp_client_config_int_get("MRCP_CLIENT_SIP_T1X64", elem, 0);
 		}
 		else if(strcasecmp(elem->name,"sip-timer-c") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				config->sip_timer_c = atol(cdata_text_get(elem));
-			}
+			config->sip_timer_c = unimrcp_client_config_int_get("MRCP_CLIENT_SIP_TIMER_C", elem, 0);
 		}
 		else if(strcasecmp(elem->name,"sip-message-output") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				config->tport_log = cdata_bool_get(elem);
-			}
+			config->tport_log = unimrcp_client_config_bool_get("MRCP_CLIENT_SIP_MESSAGE_OUTPUT", elem, FALSE);
 		}
 		else if(strcasecmp(elem->name,"sip-message-dump") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
+			const char *env_value = getenv("MRCP_CLIENT_SIP_MESSAGE_DUMP");
+			if(env_value && *env_value) {
+				apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Using environment variable MRCP_CLIENT_SIP_MESSAGE_DUMP=%s", env_value);
+				config->tport_dump_file = apr_pstrdup(loader->pool, env_value);
+			}
+			else if(is_cdata_valid(elem) == TRUE) {
 				const char *root_path;
 				const char *path = cdata_text_get(elem);
 				if(loader->dir_layout && apr_filepath_root(&root_path,&path,0,loader->pool) == APR_ERELATIVE)
@@ -516,32 +619,41 @@ static apt_bool_t unimrcp_client_mrcpv2_uac_load(unimrcp_client_loader_t *loader
 	for(elem = root->first_child; elem; elem = elem->next) {
 		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Loading Element <%s>",elem->name);
 		if(strcasecmp(elem->name,"max-connection-count") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				max_connection_count = atol(cdata_text_get(elem));
-			}
+			max_connection_count = unimrcp_client_config_int_get("MRCP_CLIENT_MAX_CONNECTION_COUNT", elem, 100);
 		}
 		else if(strcasecmp(elem->name,"offer-new-connection") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				offer_new_connection = cdata_bool_get(elem);
-			}
+			offer_new_connection = unimrcp_client_config_bool_get("MRCP_CLIENT_OFFER_NEW_CONNECTION", elem, FALSE);
 		}
 		else if(strcasecmp(elem->name,"max-shared-use-count") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				max_shared_use_count = atol(cdata_text_get(elem));
-			}
+			max_shared_use_count = unimrcp_client_config_int_get("MRCP_CLIENT_MAX_SHARED_USE_COUNT", elem, 100);
 		}
 		else if(strcasecmp(elem->name,"rx-buffer-size") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
+			const char *env_value = getenv("MRCP_CLIENT_RX_BUFFER_SIZE");
+			if(env_value && *env_value) {
+				apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Using environment variable MRCP_CLIENT_RX_BUFFER_SIZE=%s", env_value);
+				rx_buffer_size = env_value;
+			}
+			else if(is_cdata_valid(elem) == TRUE) {
 				rx_buffer_size = cdata_text_get(elem);
 			}
 		}
 		else if(strcasecmp(elem->name,"tx-buffer-size") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
+			const char *env_value = getenv("MRCP_CLIENT_TX_BUFFER_SIZE");
+			if(env_value && *env_value) {
+				apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Using environment variable MRCP_CLIENT_TX_BUFFER_SIZE=%s", env_value);
+				tx_buffer_size = env_value;
+			}
+			else if(is_cdata_valid(elem) == TRUE) {
 				tx_buffer_size = cdata_text_get(elem);
 			}
 		}
 		else if(strcasecmp(elem->name,"request-timeout") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
+			const char *env_value = getenv("MRCP_CLIENT_REQUEST_TIMEOUT");
+			if(env_value && *env_value) {
+				apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Using environment variable MRCP_CLIENT_REQUEST_TIMEOUT=%s", env_value);
+				request_timeout = env_value;
+			}
+			else if(is_cdata_valid(elem) == TRUE) {
 				request_timeout = cdata_text_get(elem);
 			}
 		}
@@ -577,9 +689,7 @@ static apt_bool_t unimrcp_client_media_engine_load(unimrcp_client_loader_t *load
 	for(elem = root->first_child; elem; elem = elem->next) {
 		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Loading Element <%s>",elem->name);
 		if(strcasecmp(elem->name,"realtime-rate") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				realtime_rate = atol(cdata_text_get(elem));
-			}
+			realtime_rate = unimrcp_client_config_int_get("MRCP_CLIENT_REALTIME_RATE", elem, 1);
 		}
 		else {
 			apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Unknown Element <%s>",elem->name);
@@ -616,14 +726,10 @@ static apt_bool_t unimrcp_client_rtp_factory_load(unimrcp_client_loader_t *loade
 			rtp_ext_ip = unimrcp_client_ip_address_get(loader,elem,loader->ext_ip);
 		}
 		else if(strcasecmp(elem->name,"rtp-port-min") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				rtp_config->rtp_port_min = (apr_port_t)atol(cdata_text_get(elem));
-			}
+			rtp_config->rtp_port_min = (apr_port_t)unimrcp_client_config_int_get("MRCP_CLIENT_RTP_PORT_MIN", elem, DEFAULT_RTP_PORT_MIN);
 		}
 		else if(strcasecmp(elem->name,"rtp-port-max") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				rtp_config->rtp_port_max = (apr_port_t)atol(cdata_text_get(elem));
-			}
+			rtp_config->rtp_port_max = (apr_port_t)unimrcp_client_config_int_get("MRCP_CLIENT_RTP_PORT_MAX", elem, DEFAULT_RTP_PORT_MAX);
 		}
 		else {
 			apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Unknown Element <%s>",elem->name);
@@ -661,24 +767,16 @@ static apt_bool_t unimrcp_client_sip_settings_load(unimrcp_client_loader_t *load
 			settings->server_ip = unimrcp_client_ip_address_get(loader,elem,loader->server_ip);
 		}
 		else if(strcasecmp(elem->name,"server-port") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				settings->server_port = (apr_port_t)atol(cdata_text_get(elem));
-			}
+			settings->server_port = (apr_port_t)unimrcp_client_config_int_get("MRCP_CLIENT_SERVER_PORT", elem, 0);
 		}
 		else if(strcasecmp(elem->name,"server-username") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				settings->user_name = cdata_copy(elem,loader->pool);
-			}
+			settings->user_name = unimrcp_client_config_string_get("MRCP_CLIENT_SERVER_USERNAME", elem, NULL, loader->pool);
 		}
 		else if(strcasecmp(elem->name,"force-destination") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				settings->force_destination = cdata_bool_get(elem);
-			}
+			settings->force_destination = unimrcp_client_config_bool_get("MRCP_CLIENT_FORCE_DESTINATION", elem, FALSE);
 		}
 		else if(strcasecmp(elem->name,"feature-tags") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				settings->feature_tags = cdata_copy(elem,loader->pool);
-			}
+			settings->feature_tags = unimrcp_client_config_string_get("MRCP_CLIENT_FEATURE_TAGS", elem, NULL, loader->pool);
 		}
 		else {
 			apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Unknown Element <%s>",elem->name);
@@ -706,18 +804,15 @@ static apt_bool_t unimrcp_client_rtsp_settings_load(unimrcp_client_loader_t *loa
 			settings->server_ip = unimrcp_client_ip_address_get(loader,elem,loader->server_ip);
 		}
 		else if(strcasecmp(elem->name,"server-port") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				settings->server_port = (apr_port_t)atol(cdata_text_get(elem));
-			}
+			settings->server_port = (apr_port_t)unimrcp_client_config_int_get("MRCP_CLIENT_SERVER_PORT", elem, 0);
 		}
 		else if(strcasecmp(elem->name,"force-destination") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				settings->force_destination = cdata_bool_get(elem);
-			}
+			settings->force_destination = unimrcp_client_config_bool_get("MRCP_CLIENT_FORCE_DESTINATION", elem, FALSE);
 		}
 		else if(strcasecmp(elem->name,"resource-location") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				settings->resource_location = cdata_copy(elem,loader->pool);
+			const char *location = unimrcp_client_config_string_get("MRCP_CLIENT_RESOURCE_LOCATION", elem, DEFAULT_RESOURCE_LOCATION, loader->pool);
+			if(location && *location) {
+				settings->resource_location = location;
 			}
 			else {
 				settings->resource_location = "";
