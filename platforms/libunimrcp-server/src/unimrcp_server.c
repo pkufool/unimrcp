@@ -244,6 +244,22 @@ static char* unimrcp_server_ip_address_get(unimrcp_server_loader_t *loader, cons
 	return apr_pstrdup(loader->pool,loader->ip);
 }
 
+/** 
+ * Environment Variable Configuration Support
+ * 
+ * The following functions provide support for overriding XML configuration
+ * values with environment variables. Environment variable names follow the
+ * convention: MRCP_SERVER_<UPPERCASE_CONFIG_NAME> where hyphens are converted
+ * to underscores. For example:
+ * - sip-port -> MRCP_SERVER_SIP_PORT
+ * - mrcp-ip -> MRCP_SERVER_MRCP_IP
+ * - rtp-port-min -> MRCP_SERVER_RTP_PORT_MIN
+ * 
+ * If an environment variable is set, its value takes precedence over the
+ * corresponding XML configuration value. If not set, the XML value is used
+ * as fallback, maintaining full backward compatibility.
+ */
+
 /** Helper function to get environment variable value for MRCP server configuration */
 static const char* unimrcp_server_env_get(const char* config_name)
 {
@@ -363,7 +379,12 @@ static apt_bool_t unimrcp_server_resource_factory_load(unimrcp_server_loader_t *
 	return mrcp_server_resource_factory_register(loader->server,resource_factory);
 }
 
-/** Load SofiaSIP signaling agent */
+/** Load SofiaSIP signaling agent 
+ * Configuration values can be overridden with environment variables:
+ * - sip-ip: MRCP_SERVER_SIP_IP
+ * - sip-port: MRCP_SERVER_SIP_PORT  
+ * - sip-ext-ip: MRCP_SERVER_SIP_EXT_IP
+ */
 static apt_bool_t unimrcp_server_sip_uas_load(unimrcp_server_loader_t *loader, const apr_xml_elem *root, const char *id)
 {
 	const apr_xml_elem *elem;
@@ -505,7 +526,11 @@ static apt_bool_t unimrcp_server_sip_uas_load(unimrcp_server_loader_t *loader, c
 	return mrcp_server_signaling_agent_register(loader->server,agent);
 }
 
-/** Load UniRTSP signaling agent */
+/** Load UniRTSP signaling agent 
+ * Configuration values can be overridden with environment variables:
+ * - rtsp-ip: MRCP_SERVER_RTSP_IP
+ * - rtsp-port: MRCP_SERVER_RTSP_PORT
+ */
 static apt_bool_t unimrcp_server_rtsp_uas_load(unimrcp_server_loader_t *loader, const apr_xml_elem *root, const char *id)
 {
 	const apr_xml_elem *elem;
@@ -570,7 +595,11 @@ static apt_bool_t unimrcp_server_rtsp_uas_load(unimrcp_server_loader_t *loader, 
 	return mrcp_server_signaling_agent_register(loader->server,agent);
 }
 
-/** Load MRCPv2 connection agent */
+/** Load MRCPv2 connection agent 
+ * Configuration values can be overridden with environment variables:
+ * - mrcp-ip: MRCP_SERVER_MRCP_IP
+ * - mrcp-port: MRCP_SERVER_MRCP_PORT
+ */
 static apt_bool_t unimrcp_server_mrcpv2_uas_load(unimrcp_server_loader_t *loader, const apr_xml_elem *root, const char *id)
 {
 	const apr_xml_elem *elem;
@@ -681,7 +710,13 @@ static apt_bool_t unimrcp_server_media_engine_load(unimrcp_server_loader_t *load
 	return mrcp_server_media_engine_register(loader->server,media_engine);
 }
 
-/** Load RTP factory */
+/** Load RTP factory 
+ * Configuration values can be overridden with environment variables:
+ * - rtp-ip: MRCP_SERVER_RTP_IP
+ * - rtp-ext-ip: MRCP_SERVER_RTP_EXT_IP
+ * - rtp-port-min: MRCP_SERVER_RTP_PORT_MIN
+ * - rtp-port-max: MRCP_SERVER_RTP_PORT_MAX
+ */
 static apt_bool_t unimrcp_server_rtp_factory_load(unimrcp_server_loader_t *loader, const apr_xml_elem *root, const char *id)
 {
 	const apr_xml_elem *elem;
