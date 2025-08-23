@@ -15,6 +15,7 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
 #include <apr_xml.h>
 #include <apr_version.h>
 #include "uni_version.h"
@@ -243,6 +244,81 @@ static char* unimrcp_server_ip_address_get(unimrcp_server_loader_t *loader, cons
 	return apr_pstrdup(loader->pool,loader->ip);
 }
 
+/** Helper function to get environment variable value for MRCP server configuration */
+static const char* unimrcp_server_env_get(const char* config_name)
+{
+	char env_name[256];
+	const char* env_value;
+	
+	/* Convert config name to environment variable name: MRCP_SERVER_<UPPERCASE_CONFIG_NAME> */
+	snprintf(env_name, sizeof(env_name), "MRCP_SERVER_%s", config_name);
+	
+	/* Convert hyphens to underscores and make uppercase */
+	char* p = env_name + 12; /* Start after "MRCP_SERVER_" */
+	while(*p) {
+		if(*p == '-') {
+			*p = '_';
+		} else if(*p >= 'a' && *p <= 'z') {
+			*p = *p - 'a' + 'A';
+		}
+		p++;
+	}
+	
+	env_value = getenv(env_name);
+	if(env_value && *env_value != '\0') {
+		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Using environment variable %s=%s", env_name, env_value);
+		return env_value;
+	}
+	
+	return NULL;
+}
+
+/** Helper function to get configuration string value with environment variable override */
+static char* unimrcp_server_config_string_get(unimrcp_server_loader_t *loader, const apr_xml_elem *elem, const char* config_name)
+{
+	const char* env_value = unimrcp_server_env_get(config_name);
+	if(env_value) {
+		return apr_pstrdup(loader->pool, env_value);
+	}
+	
+	/* Fall back to XML configuration */
+	if(is_cdata_valid(elem) == TRUE) {
+		return cdata_copy(elem, loader->pool);
+	}
+	
+	return NULL;
+}
+
+/** Helper function to get configuration port value with environment variable override */
+static apr_port_t unimrcp_server_config_port_get(unimrcp_server_loader_t *loader, const apr_xml_elem *elem, const char* config_name, apr_port_t default_port)
+{
+	const char* env_value = unimrcp_server_env_get(config_name);
+	if(env_value) {
+		apr_port_t port = (apr_port_t)atol(env_value);
+		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Using environment variable %s=%d for %s", config_name, port, config_name);
+		return port;
+	}
+	
+	/* Fall back to XML configuration */
+	if(is_cdata_valid(elem) == TRUE) {
+		return (apr_port_t)atol(cdata_text_get(elem));
+	}
+	
+	return default_port;
+}
+
+/** Helper function to get IP address with environment variable override */
+static char* unimrcp_server_config_ip_get(unimrcp_server_loader_t *loader, const apr_xml_elem *elem, const char* config_name)
+{
+	const char* env_value = unimrcp_server_env_get(config_name);
+	if(env_value) {
+		return apr_pstrdup(loader->pool, env_value);
+	}
+	
+	/* Fall back to existing IP address resolution logic */
+	return unimrcp_server_ip_address_get(loader, elem);
+}
+
 /** Load resource */
 static apt_bool_t unimrcp_server_resource_load(mrcp_resource_loader_t *resource_loader, const apr_xml_elem *root, apr_pool_t *pool)
 {
@@ -303,15 +379,13 @@ static apt_bool_t unimrcp_server_sip_uas_load(unimrcp_server_loader_t *loader, c
 	for(elem = root->first_child; elem; elem = elem->next) {
 		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Loading Element <%s>",elem->name);
 		if(strcasecmp(elem->name,"sip-ip") == 0) {
-			config->local_ip = unimrcp_server_ip_address_get(loader,elem);
+			config->local_ip = unimrcp_server_config_ip_get(loader,elem,"sip-ip");
 		}
 		else if(strcasecmp(elem->name,"sip-ext-ip") == 0) {
-			config->ext_ip = unimrcp_server_ip_address_get(loader,elem);
+			config->ext_ip = unimrcp_server_config_ip_get(loader,elem,"sip-ext-ip");
 		}
 		else if(strcasecmp(elem->name,"sip-port") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				config->local_port = (apr_port_t)atol(cdata_text_get(elem));
-			}
+			config->local_port = unimrcp_server_config_port_get(loader,elem,"sip-port",DEFAULT_SIP_PORT);
 		}
 		else if(strcasecmp(elem->name,"sip-transport") == 0) {
 			if(is_cdata_valid(elem) == TRUE) {
@@ -445,12 +519,10 @@ static apt_bool_t unimrcp_server_rtsp_uas_load(unimrcp_server_loader_t *loader, 
 	for(elem = root->first_child; elem; elem = elem->next) {
 		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Loading Element <%s>",elem->name);
 		if(strcasecmp(elem->name,"rtsp-ip") == 0) {
-			config->local_ip = unimrcp_server_ip_address_get(loader,elem);
+			config->local_ip = unimrcp_server_config_ip_get(loader,elem,"rtsp-ip");
 		}
 		else if(strcasecmp(elem->name,"rtsp-port") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				config->local_port = (apr_port_t)atol(cdata_text_get(elem));
-			}
+			config->local_port = unimrcp_server_config_port_get(loader,elem,"rtsp-port",DEFAULT_RTSP_PORT);
 		}
 		else if(strcasecmp(elem->name,"sdp-origin") == 0) {
 			if(is_cdata_valid(elem) == TRUE) {
@@ -517,12 +589,10 @@ static apt_bool_t unimrcp_server_mrcpv2_uas_load(unimrcp_server_loader_t *loader
 	for(elem = root->first_child; elem; elem = elem->next) {
 		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Loading Element <%s>",elem->name);
 		if(strcasecmp(elem->name,"mrcp-ip") == 0) {
-			mrcp_ip = unimrcp_server_ip_address_get(loader,elem);
+			mrcp_ip = unimrcp_server_config_ip_get(loader,elem,"mrcp-ip");
 		}
 		else if(strcasecmp(elem->name,"mrcp-port") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				mrcp_port = (apr_port_t)atol(cdata_text_get(elem));
-			}
+			mrcp_port = unimrcp_server_config_port_get(loader,elem,"mrcp-port",DEFAULT_MRCP_PORT);
 		}
 		else if(strcasecmp(elem->name,"max-connection-count") == 0) {
 			if(is_cdata_valid(elem) == TRUE) {
@@ -628,20 +698,16 @@ static apt_bool_t unimrcp_server_rtp_factory_load(unimrcp_server_loader_t *loade
 	for(elem = root->first_child; elem; elem = elem->next) {
 		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Loading Element <%s>",elem->name);
 		if(strcasecmp(elem->name,"rtp-ip") == 0) {
-			rtp_ip = unimrcp_server_ip_address_get(loader,elem);
+			rtp_ip = unimrcp_server_config_ip_get(loader,elem,"rtp-ip");
 		}
 		else if(strcasecmp(elem->name,"rtp-ext-ip") == 0) {
-			rtp_ext_ip = unimrcp_server_ip_address_get(loader,elem);
+			rtp_ext_ip = unimrcp_server_config_ip_get(loader,elem,"rtp-ext-ip");
 		}
 		else if(strcasecmp(elem->name,"rtp-port-min") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				rtp_config->rtp_port_min = (apr_port_t)atol(cdata_text_get(elem));
-			}
+			rtp_config->rtp_port_min = unimrcp_server_config_port_get(loader,elem,"rtp-port-min",DEFAULT_RTP_PORT_MIN);
 		}
 		else if(strcasecmp(elem->name,"rtp-port-max") == 0) {
-			if(is_cdata_valid(elem) == TRUE) {
-				rtp_config->rtp_port_max = (apr_port_t)atol(cdata_text_get(elem));
-			}
+			rtp_config->rtp_port_max = unimrcp_server_config_port_get(loader,elem,"rtp-port-max",DEFAULT_RTP_PORT_MAX);
 		}
 		else {
 			apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Unknown Element <%s>",elem->name);
