@@ -272,18 +272,28 @@ ASR_CLIENT_DECLARE(apt_bool_t) asr_session_file_recognize_send(
 
 /**
  * Receive MRCP event.
- * Enhanced for long audio transcription with automatic STOP handling and partial results.
+ * Enhanced for long audio transcription with partial results handling.
  * 
  * @param session the session to receive an event in the scope of
  * @return the MRCP event ID (RECOGNIZER_START_OF_INPUT, RECOGNIZER_INTERPRETATION_COMPLETE, 
  *         RECOGNIZER_RECOGNITION_COMPLETE, or RECOGNIZER_EVENT_COUNT on timeout)
  * 
  * @note This function now:
- *       - Automatically sends RECOGNIZER_STOP when input_complete flag is set
  *       - Handles and logs RECOGNIZER_INTERPRETATION_COMPLETE events for partial results
  *       - Parses and logs both partial and final NLSML results
+ *       - Works with the main loop to automatically send STOP when input is complete
  */
 ASR_CLIENT_DECLARE(mrcp_recognizer_event_id) asr_session_file_recognize_receive(asr_session_t *session);
+
+/**
+ * Check if input is complete and send RECOGNIZER_STOP message if needed.
+ * @param session the session to check and send STOP message for
+ * @return TRUE if STOP message was sent successfully, FALSE otherwise
+ * 
+ * @note This function is called automatically by asr_session_file_recognize()
+ *       but can also be used manually in custom event loops
+ */
+ASR_CLIENT_DECLARE(apt_bool_t) asr_session_check_and_stop(asr_session_t *session);
 
 /**
  * Get NLSML instance.

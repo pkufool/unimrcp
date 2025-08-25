@@ -42,6 +42,11 @@
 # Build directories
 build-cmake/
 
+# Test files
+test_long_audio_logic
+test_long_audio_logic.c
+*.o
+
 # /build/
 /build/ltmain.sh
 /build/depcomp

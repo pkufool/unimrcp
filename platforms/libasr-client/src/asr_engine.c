@@ -694,6 +694,9 @@ ASR_CLIENT_DECLARE(const char*) asr_session_file_recognize(
 
 	asr_session_file_recognize_send(asr_session,grammar_file,input_file,uri_count,weights,set_params_file,send_set_params);
 	do {
+		/* Check if input is complete and send STOP message if needed */
+		asr_session_check_and_stop(asr_session);
+		
 		mrcp_recognizer_event_id event_id = asr_session_file_recognize_receive(asr_session);
 
 		if(event_id == RECOGNIZER_START_OF_INPUT) {
@@ -1073,14 +1076,6 @@ ASR_CLIENT_DECLARE(mrcp_recognizer_event_id) asr_session_file_recognize_receive(
 	const mrcp_app_message_t *app_message = NULL;
 	mrcp_message_t *mrcp_message;
 
-	/* Check if input is complete and STOP message needs to be sent */
-	if(asr_session->input_complete == TRUE && asr_session->streaming == FALSE) {
-		asr_session->input_complete = FALSE; /* Reset flag */
-		if(asr_session_stop_send(asr_session) == FALSE) {
-			apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Failed to send RECOGNIZER_STOP message");
-		}
-	}
-
 	apr_thread_mutex_lock(asr_session->mutex);
 	if(apr_thread_cond_timedwait(asr_session->wait_object,asr_session->mutex,60 * 1000000) != APR_SUCCESS) {
 		apr_thread_mutex_unlock(asr_session->mutex);
@@ -1122,6 +1117,23 @@ ASR_CLIENT_DECLARE(mrcp_recognizer_event_id) asr_session_file_recognize_receive(
 	}
 
 	return mrcp_message->start_line.method_id;
+}
+
+/** Check if input is complete and send RECOGNIZER_STOP message if needed */
+ASR_CLIENT_DECLARE(apt_bool_t) asr_session_check_and_stop(asr_session_t *asr_session)
+{
+	/* Check if input is complete and STOP message needs to be sent */
+	if(asr_session->input_complete == TRUE && asr_session->streaming == FALSE) {
+		asr_session->input_complete = FALSE; /* Reset flag */
+		if(asr_session_stop_send(asr_session) == TRUE) {
+			return TRUE;
+		}
+		else {
+			apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Failed to send RECOGNIZER_STOP message");
+			return FALSE;
+		}
+	}
+	return FALSE; /* No STOP message needed */
 }
 
 // udpate note - is this ever used? Should it be removed?
