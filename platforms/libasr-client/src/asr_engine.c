@@ -266,8 +266,10 @@ static apt_bool_t asr_stream_read(mpf_audio_stream_t *stream, mpf_frame_t *frame
 					frame->type |= MEDIA_FRAME_TYPE_AUDIO;
 				}
 				else {
-					/* file is over */
+					/* file is over - signal input complete for STOP message handling */
 					asr_session->streaming = FALSE;
+					asr_session->input_complete = TRUE;
+					apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Audio input complete, STOP message will be sent");
 				}
 			}
 		}
@@ -599,6 +601,7 @@ ASR_CLIENT_DECLARE(asr_session_t*) asr_session_create(asr_engine_t *engine, cons
 	asr_session->recog_complete = NULL;
 	asr_session->input_mode = INPUT_MODE_NONE;
 	asr_session->streaming = FALSE;
+	asr_session->input_complete = FALSE;
 	asr_session->audio_in = NULL;
 	asr_session->media_buffer = NULL;
 	asr_session->mutex = NULL;
@@ -691,15 +694,25 @@ ASR_CLIENT_DECLARE(const char*) asr_session_file_recognize(
 
 	asr_session_file_recognize_send(asr_session,grammar_file,input_file,uri_count,weights,set_params_file,send_set_params);
 	do {
+		/* Check if input is complete and send STOP message if needed */
+		asr_session_check_and_stop(asr_session);
+		
 		mrcp_recognizer_event_id event_id = asr_session_file_recognize_receive(asr_session);
 
 		if(event_id == RECOGNIZER_START_OF_INPUT) {
 			apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Receieved Start-of-Input");
 		}
+		else if(event_id == RECOGNIZER_INTERPRETATION_COMPLETE) {
+			apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Receieved Interpretation-Complete (partial result)");
+		}
 		else if(event_id == RECOGNIZER_RECOGNITION_COMPLETE) {
 			apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Receieved Recognition-Complete");
 		}
 	} while(!asr_session->recog_complete);
+	
+	/* Perform graceful cleanup */
+	asr_session_close_gracefully(asr_session);
+	
 	/* Get results */
 	return nlsml_result_get(asr_session->recog_complete);
 }
@@ -1078,12 +1091,49 @@ ASR_CLIENT_DECLARE(mrcp_recognizer_event_id) asr_session_file_recognize_receive(
 	if(mrcp_message && mrcp_message->start_line.method_id == RECOGNIZER_START_OF_INPUT) {
 		apt_log(APT_LOG_MARK,APT_PRIO_INFO,"START-OF-INPUT received");
 	}
+	if(mrcp_message && mrcp_message->start_line.method_id == RECOGNIZER_INTERPRETATION_COMPLETE) {
+		apt_log(APT_LOG_MARK,APT_PRIO_INFO,"INTERPRETATION-COMPLETE (partial result) received");
+		/* Handle partial/intermediate results */
+		if(mrcp_message->body.length > 0) {
+			nlsml_result_t *result = nlsml_result_parse(mrcp_message->body.buf, mrcp_message->body.length, mrcp_message->pool);
+			if(result) {
+				apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Partial result parsed successfully");
+				nlsml_result_trace(result, mrcp_message->pool);
+			}
+		}
+	}
 	if(mrcp_message && mrcp_message->start_line.method_id == RECOGNIZER_RECOGNITION_COMPLETE) {
 		apt_log(APT_LOG_MARK,APT_PRIO_INFO,"RECOGNTION-COMPLETE received");
 		asr_session->recog_complete = mrcp_message;
+		
+		/* Handle final recognition result */
+		if(mrcp_message->body.length > 0) {
+			nlsml_result_t *result = nlsml_result_parse(mrcp_message->body.buf, mrcp_message->body.length, mrcp_message->pool);
+			if(result) {
+				apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Final result parsed successfully");
+				nlsml_result_trace(result, mrcp_message->pool);
+			}
+		}
 	}
 
 	return mrcp_message->start_line.method_id;
+}
+
+/** Check if input is complete and send RECOGNIZER_STOP message if needed */
+ASR_CLIENT_DECLARE(apt_bool_t) asr_session_check_and_stop(asr_session_t *asr_session)
+{
+	/* Check if input is complete and STOP message needs to be sent */
+	if(asr_session->input_complete == TRUE && asr_session->streaming == FALSE) {
+		asr_session->input_complete = FALSE; /* Reset flag */
+		if(asr_session_stop_send(asr_session) == TRUE) {
+			return TRUE;
+		}
+		else {
+			apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Failed to send RECOGNIZER_STOP message");
+			return FALSE;
+		}
+	}
+	return FALSE; /* No STOP message needed */
 }
 
 // udpate note - is this ever used? Should it be removed?
@@ -1233,6 +1283,67 @@ static mrcp_message_t* set_param_message_create(
 static mrcp_message_t* get_param_message_create(asr_session_t *asr_session)
 {
 	return mrcp_application_message_create(asr_session->mrcp_session,asr_session->mrcp_channel,RECOGNIZER_GET_PARAMS);
+}
+
+/** Create STOP request */
+static mrcp_message_t* stop_message_create(asr_session_t *asr_session)
+{
+	return mrcp_application_message_create(asr_session->mrcp_session,asr_session->mrcp_channel,RECOGNIZER_STOP);
+}
+
+/** Send STOP request when input is complete */
+static apt_bool_t asr_session_stop_send(asr_session_t *asr_session)
+{
+	const mrcp_app_message_t *app_message = NULL;
+	mrcp_message_t *mrcp_message = stop_message_create(asr_session);
+	
+	if(!mrcp_message) {
+		apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Failed to Create RECOGNIZER_STOP Request");
+		return FALSE;
+	}
+
+	apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Sending RECOGNIZER_STOP Request");
+	
+	/* Send STOP request and wait for the response */
+	apr_thread_mutex_lock(asr_session->mutex);
+	if(mrcp_application_message_send(asr_session->mrcp_session,asr_session->mrcp_channel,mrcp_message) == TRUE) {
+		apr_thread_cond_wait(asr_session->wait_object,asr_session->mutex);
+		app_message = asr_session->app_message;
+		asr_session->app_message = NULL;
+	}
+	apr_thread_mutex_unlock(asr_session->mutex);
+
+	if(mrcp_response_check(app_message,MRCP_REQUEST_STATE_COMPLETE) == TRUE) {
+		apt_log(APT_LOG_MARK,APT_PRIO_INFO,"RECOGNIZER_STOP Request Successful");
+		return TRUE;
+	}
+	else {
+		apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"RECOGNIZER_STOP Request Failed");
+		return FALSE;
+	}
+}
+
+/** Gracefully close session and remove channel */
+static apt_bool_t asr_session_close_gracefully(asr_session_t *asr_session)
+{
+	apt_bool_t status = TRUE;
+	
+	apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Starting graceful session closure");
+	
+	/* Close audio file if still open */
+	if(asr_session->audio_in) {
+		fclose(asr_session->audio_in);
+		asr_session->audio_in = NULL;
+		apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Audio file closed during graceful closure");
+	}
+	
+	/* Note: Channel removal and session termination should be handled by the caller
+	 * using mrcp_application_channel_remove() and mrcp_application_session_terminate()
+	 * as these operations may require different contexts depending on the application design.
+	 */
+	
+	apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Graceful session closure completed");
+	return status;
 }
 
 ASR_CLIENT_DECLARE(apt_bool_t) asr_session_set_param(

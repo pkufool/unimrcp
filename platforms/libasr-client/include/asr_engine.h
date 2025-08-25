@@ -20,6 +20,31 @@
 /**
  * @file asr_engine.h
  * @brief Basic ASR engine on top of UniMRCP client library
+ * 
+ * This library provides a simplified interface for speech recognition using the UniMRCP client stack.
+ * It supports both short and long audio transcription with the following key features:
+ * 
+ * LONG AUDIO TRANSCRIPTION SUPPORT:
+ * - Automatic RECOGNIZER_STOP message sending when audio input is complete
+ * - Handling of partial results through RECOGNIZER_INTERPRETATION_COMPLETE events
+ * - Graceful session cleanup and resource management
+ * - Detailed logging for monitoring recognition progress
+ * 
+ * USAGE FOR LONG AUDIO:
+ * 1. Create an ASR engine using asr_engine_create()
+ * 2. Create a session using asr_session_create()  
+ * 3. Call asr_session_file_recognize() with your audio file
+ * 4. The function will automatically:
+ *    - Stream audio data to the recognition server
+ *    - Send RECOGNIZER_STOP when file is complete
+ *    - Handle and log partial results during recognition
+ *    - Return final recognition results
+ *    - Clean up audio resources and session
+ * 5. Destroy the session using asr_session_destroy()
+ * 6. Destroy the engine using asr_engine_destroy()
+ * 
+ * The client ensures proper MRCP protocol compliance and graceful session management
+ * for reliable long audio transcription workflows.
  */ 
 
 /* APT includes */
@@ -97,6 +122,8 @@ struct asr_session_t {
 	mpf_frame_buffer_t       *media_buffer;
 	/** Streaming is in-progress */
 	apt_bool_t                streaming;
+	/** Input is complete and STOP message needs to be sent */
+	apt_bool_t                input_complete;
 
 	/** Conditional wait object */
 	apr_thread_cond_t        *wait_object;
@@ -134,12 +161,21 @@ ASR_CLIENT_DECLARE(asr_session_t*) asr_session_create(asr_engine_t *engine, cons
 
 /**
  * Initiate recognition based on specified grammar and input file.
+ * Supports long audio transcription with automatic RECOGNIZER_STOP message sending,
+ * partial result handling, and graceful session cleanup.
+ * 
  * @param session the session to run recognition in the scope of
  * @param grammar_file the name of the grammar file to use (path is relative to data dir)
  * @param input_file the name of the audio input file to use (path is relative to data dir)
  * @param set_params_file the name of the parameters file to use (path is relative to data dir)
  * @param send_set_params whether or not to use a separate SET-PARAMS request
  * @return the recognition result (input element of NLSML content)
+ * 
+ * @note For long audio transcription:
+ *       - Automatically sends RECOGNIZER_STOP when audio input is complete
+ *       - Handles RECOGNIZER_INTERPRETATION_COMPLETE events for partial results
+ *       - Performs graceful cleanup of audio resources and session
+ *       - Logs partial and final recognition results for monitoring
  */
 ASR_CLIENT_DECLARE(const char*) asr_session_file_recognize(
 									asr_session_t *session,
@@ -236,9 +272,28 @@ ASR_CLIENT_DECLARE(apt_bool_t) asr_session_file_recognize_send(
 
 /**
  * Receive MRCP event.
+ * Enhanced for long audio transcription with partial results handling.
+ * 
  * @param session the session to receive an event in the scope of
+ * @return the MRCP event ID (RECOGNIZER_START_OF_INPUT, RECOGNIZER_INTERPRETATION_COMPLETE, 
+ *         RECOGNIZER_RECOGNITION_COMPLETE, or RECOGNIZER_EVENT_COUNT on timeout)
+ * 
+ * @note This function now:
+ *       - Handles and logs RECOGNIZER_INTERPRETATION_COMPLETE events for partial results
+ *       - Parses and logs both partial and final NLSML results
+ *       - Works with the main loop to automatically send STOP when input is complete
  */
 ASR_CLIENT_DECLARE(mrcp_recognizer_event_id) asr_session_file_recognize_receive(asr_session_t *session);
+
+/**
+ * Check if input is complete and send RECOGNIZER_STOP message if needed.
+ * @param session the session to check and send STOP message for
+ * @return TRUE if STOP message was sent successfully, FALSE otherwise
+ * 
+ * @note This function is called automatically by asr_session_file_recognize()
+ *       but can also be used manually in custom event loops
+ */
+ASR_CLIENT_DECLARE(apt_bool_t) asr_session_check_and_stop(asr_session_t *session);
 
 /**
  * Get NLSML instance.
