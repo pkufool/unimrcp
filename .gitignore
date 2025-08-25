@@ -39,6 +39,9 @@
 # /.build/
 /.build*
 
+# Build directories
+build-cmake/
+
 # /build/
 /build/ltmain.sh
 /build/depcomp
