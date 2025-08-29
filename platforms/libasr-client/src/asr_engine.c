@@ -254,6 +254,44 @@ static apt_bool_t asr_input_file_open(asr_session_t *asr_session, const char *in
 	return TRUE;
 }
 
+static apt_bool_t handle_recognizer_stop_response(asr_session_t *asr_session)
+{
+	const mrcp_app_message_t *app_message = NULL;
+
+	// Wait for the response to RECOGNIZER_STOP
+	apr_thread_mutex_lock(asr_session->mutex);
+	apr_thread_cond_wait(asr_session->wait_object, asr_session->mutex);
+	app_message = asr_session->app_message;
+	asr_session->app_message = NULL;
+	apr_thread_mutex_unlock(asr_session->mutex);
+
+	// Check for valid response
+	if(app_message && app_message->message_type == MRCP_APP_MESSAGE_TYPE_CONTROL &&
+	   app_message->control_message &&
+	   app_message->control_message->start_line.method_id == RECOGNIZER_STOP &&
+	   app_message->control_message->start_line.message_type == MRCP_MESSAGE_TYPE_RESPONSE)
+	{
+		if(app_message->control_message->start_line.status_code == MRCP_STATUS_CODE_SUCCESS) {
+			apt_log(APT_LOG_MARK, APT_PRIO_INFO, "RECOGNIZER-STOP response: SUCCESS");
+			// Mark session as stopped, release resources if necessary
+      asr_session_destroy_ex(asr_session, FALSE);
+			asr_session->streaming = FALSE;
+			if(asr_session->audio_in) {
+				fclose(asr_session->audio_in);
+				asr_session->audio_in = NULL;
+			}
+			// You may want to reset any recognition result variables here
+			return TRUE;
+		} else {
+			apt_log(APT_LOG_MARK, APT_PRIO_WARNING, "RECOGNIZER-STOP response: FAILED");
+			return FALSE;
+		}
+	} else {
+		apt_log(APT_LOG_MARK, APT_PRIO_WARNING, "RECOGNIZER-STOP response: Not received or invalid");
+		return FALSE;
+	}
+}
+
 /** MPF callback to read audio frame */
 static apt_bool_t asr_stream_read(mpf_audio_stream_t *stream, mpf_frame_t *frame)
 {
@@ -268,6 +306,24 @@ static apt_bool_t asr_stream_read(mpf_audio_stream_t *stream, mpf_frame_t *frame
 				else {
 					/* file is over */
 					asr_session->streaming = FALSE;
+          // --- SEND RECOGNIZE-STOP MESSAGE TO SERVER ---
+					mrcp_message_t *stop_msg = mrcp_application_message_create(
+						asr_session->mrcp_session,
+						asr_session->mrcp_channel,
+						RECOGNIZER_STOP);
+
+					if(stop_msg) {
+            apr_thread_mutex_lock(asr_session->mutex);
+		        if(mrcp_application_message_send(asr_session->mrcp_session, asr_session->mrcp_channel, stop_msg) == TRUE) {
+		          apr_thread_mutex_unlock(asr_session->mutex);
+		          // Handle stop response:
+		          handle_recognizer_stop_response(asr_session);
+		        } else {
+		          apr_thread_mutex_unlock(asr_session->mutex);
+		          apt_log(APT_LOG_MARK, APT_PRIO_WARNING, "Failed to send RECOGNIZER-STOP message");
+		        }
+					}
+					// --- END SEND RECOGNIZE-STOP ---
 				}
 			}
 		}
@@ -694,10 +750,10 @@ ASR_CLIENT_DECLARE(const char*) asr_session_file_recognize(
 		mrcp_recognizer_event_id event_id = asr_session_file_recognize_receive(asr_session);
 
 		if(event_id == RECOGNIZER_START_OF_INPUT) {
-			apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Receieved Start-of-Input");
+			apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Receieved Start-of-Input");
 		}
 		else if(event_id == RECOGNIZER_RECOGNITION_COMPLETE) {
-			apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Receieved Recognition-Complete");
+			apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Receieved Recognition-Complete");
 		}
 	} while(!asr_session->recog_complete);
 	/* Get results */
