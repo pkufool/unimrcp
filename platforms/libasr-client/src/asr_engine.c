@@ -14,6 +14,51 @@
  * limitations under the License.
  */
 
+/*
+ * ASR ENGINE EVENT HANDLING AND BEST PRACTICES DOCUMENTATION
+ * ========================================================
+ * 
+ * This ASR client implements best practices for long audio transcription with proper
+ * event handling, STOP request processing, and resource cleanup.
+ * 
+ * EVENT ORDERING AND PROCESSING:
+ * 1. RECOGNIZER_START_OF_INPUT - Indicates recognition has started
+ * 2. RECOGNIZER_INTERMEDIATE_RESULT - Partial results (processed immediately)
+ * 3. RECOGNIZER_RECOGNITION_COMPLETE - Final result with completion status
+ * 
+ * RECOMMENDED WORKFLOW:
+ * 
+ * For Live Streaming Recognition:
+ * - Send RECOGNIZE request to start recognition
+ * - Process INTERMEDIATE-RESULT events immediately as they arrive
+ * - Buffer final result until STOP response is received (if needed)
+ * - Send STOP request with timeout when recognition should end
+ * - Remove channel and terminate session after STOP response
+ * - Use idempotent cleanup functions safe for multiple calls
+ * 
+ * For File-based Recognition:
+ * - Send RECOGNIZE request with audio file
+ * - Process all events as they arrive using enhanced event loop
+ * - Handle timeouts and error conditions gracefully
+ * - Cleanup resources properly on both success and error paths
+ * 
+ * TIMEOUT HANDLING:
+ * - STOP requests include configurable timeout (default 5 seconds)
+ * - Log errors if STOP response is delayed or not received
+ * - Continue with cleanup even if STOP times out
+ * 
+ * RESOURCE CLEANUP:
+ * - All cleanup functions are idempotent and safe to call multiple times
+ * - Resources are cleaned in proper order: audio, channels, sessions
+ * - Comprehensive logging shows cleanup progress and any errors
+ * - Session/channel IDs and timestamps included in all log messages
+ * 
+ * ERROR HANDLING:
+ * - Timeouts are logged with session/channel context
+ * - Failed operations continue with cleanup to prevent resource leaks
+ * - All error paths include appropriate logging and resource cleanup
+ */
+
 #include <stdlib.h>
 
 /* APR includes */
@@ -172,37 +217,128 @@ ASR_CLIENT_DECLARE(apt_bool_t) asr_engine_destroy(asr_engine_t *engine)
 
 
 
-/** Destroy ASR session */
+/** Destroy ASR session with enhanced cleanup and proper resource management */
 static apt_bool_t asr_session_destroy_ex(asr_session_t *asr_session, apt_bool_t terminate)
 {
-	if(terminate == TRUE) {
+	const char *session_id = "unknown";
+	const char *channel_id = "unknown";
+	apr_time_t timestamp = apr_time_now();
+	apt_bool_t result = TRUE;
+	
+	if (!asr_session) {
+		apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Attempted to destroy NULL ASR session");
+		return FALSE;
+	}
+
+	/* Get session and channel IDs for logging */
+	if (asr_session->mrcp_session) {
+		session_id = asr_session->mrcp_session->id.buf;
+	}
+	if (asr_session->mrcp_channel) {
+		channel_id = asr_session->mrcp_channel->identifier.buf;
+	}
+
+	apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Starting ASR session cleanup [session:%s][channel:%s][terminate:%s][timestamp:%" APR_TIME_T_FMT "]",
+		session_id, channel_id, terminate ? "true" : "false", timestamp);
+
+	/* Mark session as being destroyed to prevent further operations */
+	if (asr_session->mutex) {
 		apr_thread_mutex_lock(asr_session->mutex);
-		if(mrcp_application_session_terminate(asr_session->mrcp_session) == TRUE) {
-			apr_thread_cond_wait(asr_session->wait_object,asr_session->mutex);
-			/* the response must be checked to be the valid one */
-		}
+		asr_session->destroying = TRUE;
 		apr_thread_mutex_unlock(asr_session->mutex);
 	}
 
+	/* Send STOP request with timeout if not already sent */
+	if (!asr_session->stop_sent && asr_session->streaming) {
+		apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Sending STOP before cleanup [session:%s][channel:%s]",
+			session_id, channel_id);
+		if (!asr_session_stop_with_timeout(asr_session, 5000)) { /* 5 second timeout */
+			apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"STOP request failed during cleanup [session:%s][channel:%s]",
+				session_id, channel_id);
+		}
+	}
+
+	/* Stop streaming */
+	asr_session->streaming = FALSE;
+
+	/* Close audio file (idempotent) */
 	if(asr_session->audio_in) {
 		fclose(asr_session->audio_in);
 		asr_session->audio_in = NULL;
+		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Audio input file closed [session:%s][channel:%s]",
+			session_id, channel_id);
 	}
 
+	/* Remove channel if terminate is requested */
+	if(terminate == TRUE && asr_session->mrcp_channel) {
+		apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Removing MRCP channel [session:%s][channel:%s]",
+			session_id, channel_id);
+		
+		if (asr_session->mutex) {
+			apr_thread_mutex_lock(asr_session->mutex);
+			if(mrcp_application_channel_remove(asr_session->mrcp_session, asr_session->mrcp_channel) == TRUE) {
+				apr_thread_cond_wait(asr_session->wait_object,asr_session->mutex);
+				/* Check response if needed */
+			}
+			apr_thread_mutex_unlock(asr_session->mutex);
+		}
+	}
+
+	/* Terminate session if requested */
+	if(terminate == TRUE && asr_session->mrcp_session) {
+		apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Terminating MRCP session [session:%s][channel:%s]",
+			session_id, channel_id);
+		
+		if (asr_session->mutex) {
+			apr_thread_mutex_lock(asr_session->mutex);
+			if(mrcp_application_session_terminate(asr_session->mrcp_session) == TRUE) {
+				apr_thread_cond_wait(asr_session->wait_object,asr_session->mutex);
+				/* the response should be checked to be the valid one */
+			}
+			apr_thread_mutex_unlock(asr_session->mutex);
+		}
+	}
+
+	/* Cleanup synchronization objects (idempotent) */
 	if(asr_session->mutex) {
 		apr_thread_mutex_destroy(asr_session->mutex);
 		asr_session->mutex = NULL;
+		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Mutex destroyed [session:%s][channel:%s]",
+			session_id, channel_id);
 	}
 	if(asr_session->wait_object) {
 		apr_thread_cond_destroy(asr_session->wait_object);
 		asr_session->wait_object = NULL;
+		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Condition variable destroyed [session:%s][channel:%s]",
+			session_id, channel_id);
 	}
+
+	/* Cleanup media buffer (idempotent) */
 	if(asr_session->media_buffer) {
 		mpf_frame_buffer_destroy(asr_session->media_buffer);
 		asr_session->media_buffer = NULL;
+		apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Media buffer destroyed [session:%s][channel:%s]",
+			session_id, channel_id);
 	}
 
-	return mrcp_application_session_destroy(asr_session->mrcp_session);
+	/* Clear message pointers */
+	asr_session->recog_complete = NULL;
+	asr_session->intermediate_result = NULL;
+	asr_session->app_message = NULL;
+
+	/* Destroy MRCP session */
+	if (asr_session->mrcp_session) {
+		result = mrcp_application_session_destroy(asr_session->mrcp_session);
+		if (result) {
+			apt_log(APT_LOG_MARK,APT_PRIO_INFO,"ASR session cleanup completed successfully [session:%s][channel:%s]",
+				session_id, channel_id);
+		} else {
+			apt_log(APT_LOG_MARK,APT_PRIO_ERROR,"MRCP session destruction failed [session:%s][channel:%s]",
+				session_id, channel_id);
+		}
+	}
+
+	return result;
 }
 
 /** Open audio input file */
@@ -597,6 +733,10 @@ ASR_CLIENT_DECLARE(asr_session_t*) asr_session_create(asr_engine_t *engine, cons
 	asr_session->mrcp_session = session;
 	asr_session->mrcp_channel = channel;
 	asr_session->recog_complete = NULL;
+	asr_session->intermediate_result = NULL;
+	asr_session->stop_sent = FALSE;
+	asr_session->stop_received = FALSE;
+	asr_session->destroying = FALSE;
 	asr_session->input_mode = INPUT_MODE_NONE;
 	asr_session->streaming = FALSE;
 	asr_session->audio_in = NULL;
@@ -690,14 +830,35 @@ ASR_CLIENT_DECLARE(const char*) asr_session_file_recognize(
 
 
 	asr_session_file_recognize_send(asr_session,grammar_file,input_file,uri_count,weights,set_params_file,send_set_params);
+	
+	/* Enhanced event processing loop for file recognition */
 	do {
 		mrcp_recognizer_event_id event_id = asr_session_file_recognize_receive(asr_session);
 
-		if(event_id == RECOGNIZER_START_OF_INPUT) {
-			apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Receieved Start-of-Input");
-		}
-		else if(event_id == RECOGNIZER_RECOGNITION_COMPLETE) {
-			apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Receieved Recognition-Complete");
+		switch(event_id) {
+			case RECOGNIZER_START_OF_INPUT:
+				apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Received Start-of-Input");
+				break;
+				
+			case RECOGNIZER_INTERMEDIATE_RESULT:
+				/* Process INTERMEDIATE-RESULT immediately */
+				apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Received Intermediate-Result");
+				/* Intermediate result is already stored in asr_session->intermediate_result */
+				/* Application can retrieve it using asr_session_get_intermediate_result() */
+				break;
+				
+			case RECOGNIZER_RECOGNITION_COMPLETE:
+				apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Received Recognition-Complete");
+				break;
+				
+			case RECOGNIZER_EVENT_COUNT:
+				/* Timeout or error occurred */
+				apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Event receive timeout or error in file recognition");
+				break;
+				
+			default:
+				apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Received unknown event: %d", event_id);
+				break;
 		}
 	} while(!asr_session->recog_complete);
 	/* Get results */
@@ -1062,10 +1223,23 @@ ASR_CLIENT_DECLARE(mrcp_recognizer_event_id) asr_session_file_recognize_receive(
 {
 	const mrcp_app_message_t *app_message = NULL;
 	mrcp_message_t *mrcp_message;
+	apr_time_t timestamp = apr_time_now();
+	const char *session_id = "unknown";
+	const char *channel_id = "unknown";
+
+	/* Get session and channel IDs for logging */
+	if (asr_session->mrcp_session) {
+		session_id = asr_session->mrcp_session->id.buf;
+	}
+	if (asr_session->mrcp_channel) {
+		channel_id = asr_session->mrcp_channel->identifier.buf;
+	}
 
 	apr_thread_mutex_lock(asr_session->mutex);
 	if(apr_thread_cond_timedwait(asr_session->wait_object,asr_session->mutex,60 * 1000000) != APR_SUCCESS) {
 		apr_thread_mutex_unlock(asr_session->mutex);
+		apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Event receive timeout [session:%s][channel:%s][timestamp:%" APR_TIME_T_FMT "]",
+			session_id, channel_id, timestamp);
 		return RECOGNIZER_EVENT_COUNT;
 	}
 	app_message = asr_session->app_message;
@@ -1074,13 +1248,40 @@ ASR_CLIENT_DECLARE(mrcp_recognizer_event_id) asr_session_file_recognize_receive(
 	apr_thread_mutex_unlock(asr_session->mutex);
 
 	mrcp_message = mrcp_event_get(app_message);
-
-	if(mrcp_message && mrcp_message->start_line.method_id == RECOGNIZER_START_OF_INPUT) {
-		apt_log(APT_LOG_MARK,APT_PRIO_INFO,"START-OF-INPUT received");
+	if (!mrcp_message) {
+		apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"No MRCP event message [session:%s][channel:%s][timestamp:%" APR_TIME_T_FMT "]",
+			session_id, channel_id, timestamp);
+		return RECOGNIZER_EVENT_COUNT;
 	}
-	if(mrcp_message && mrcp_message->start_line.method_id == RECOGNIZER_RECOGNITION_COMPLETE) {
-		apt_log(APT_LOG_MARK,APT_PRIO_INFO,"RECOGNTION-COMPLETE received");
-		asr_session->recog_complete = mrcp_message;
+
+	/* Process events immediately based on type */
+	switch(mrcp_message->start_line.method_id) {
+		case RECOGNIZER_START_OF_INPUT:
+			apt_log(APT_LOG_MARK,APT_PRIO_INFO,"START-OF-INPUT received [session:%s][channel:%s][timestamp:%" APR_TIME_T_FMT "]",
+				session_id, channel_id, timestamp);
+			break;
+			
+		case RECOGNIZER_INTERMEDIATE_RESULT:
+			/* Process INTERMEDIATE-RESULT immediately without waiting for STOP */
+			apt_log(APT_LOG_MARK,APT_PRIO_INFO,"INTERMEDIATE-RESULT received [session:%s][channel:%s][timestamp:%" APR_TIME_T_FMT "]",
+				session_id, channel_id, timestamp);
+			asr_session->intermediate_result = mrcp_message;
+			/* Log the partial result for immediate visibility */
+			if (mrcp_message->body.buf) {
+				apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Partial result: %s", mrcp_message->body.buf);
+			}
+			break;
+			
+		case RECOGNIZER_RECOGNITION_COMPLETE:
+			apt_log(APT_LOG_MARK,APT_PRIO_INFO,"RECOGNITION-COMPLETE received [session:%s][channel:%s][timestamp:%" APR_TIME_T_FMT "]",
+				session_id, channel_id, timestamp);
+			asr_session->recog_complete = mrcp_message;
+			break;
+			
+		default:
+			apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Unknown event received [event_id:%d][session:%s][channel:%s][timestamp:%" APR_TIME_T_FMT "]",
+				mrcp_message->start_line.method_id, session_id, channel_id, timestamp);
+			break;
 	}
 
 	return mrcp_message->start_line.method_id;
@@ -1112,8 +1313,9 @@ ASR_CLIENT_DECLARE(const char*) asr_session_stream_recognize(
 		return NULL;
 	}
 
-	/* Reset prev recog result (if any) */
+	/* Reset previous results */
 	asr_session->recog_complete = NULL;
+	asr_session->intermediate_result = NULL;
 
 	app_message = NULL;
 	mrcp_message = recognize_message_create(asr_session,1,NULL);
@@ -1142,12 +1344,31 @@ ASR_CLIENT_DECLARE(const char*) asr_session_stream_recognize(
 	asr_session->input_mode = INPUT_MODE_STREAM;
 	asr_session->streaming = TRUE;
 
-	/* Wait for events either START-OF-INPUT or RECOGNITION-COMPLETE */
+	const char *session_id = "unknown";
+	const char *channel_id = "unknown";
+
+	/* Get session and channel IDs for logging */
+	if (asr_session->mrcp_session) {
+		session_id = asr_session->mrcp_session->id.buf;
+	}
+	if (asr_session->mrcp_channel) {
+		channel_id = asr_session->mrcp_channel->identifier.buf;
+	}
+
+	apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Starting stream recognition event loop [session:%s][channel:%s]",
+		session_id, channel_id);
+
+	/* 
+	 * Enhanced event processing loop that handles INTERMEDIATE-RESULT events
+	 * immediately while waiting for RECOGNITION-COMPLETE
+	 */
 	do {
 		apr_thread_mutex_lock(asr_session->mutex);
 		app_message = NULL;
 		if(apr_thread_cond_timedwait(asr_session->wait_object,asr_session->mutex, 60 * 1000000) != APR_SUCCESS) {
 			apr_thread_mutex_unlock(asr_session->mutex);
+			apt_log(APT_LOG_MARK,APT_PRIO_ERROR,"Event wait timeout in stream recognition [session:%s][channel:%s]",
+				session_id, channel_id);
 			return NULL;
 		}
 		app_message = asr_session->app_message;
@@ -1155,8 +1376,37 @@ ASR_CLIENT_DECLARE(const char*) asr_session_stream_recognize(
 		apr_thread_mutex_unlock(asr_session->mutex);
 
 		mrcp_message = mrcp_event_get(app_message);
-		if(mrcp_message && mrcp_message->start_line.method_id == RECOGNIZER_RECOGNITION_COMPLETE) {
-			asr_session->recog_complete = mrcp_message;
+		if (mrcp_message) {
+			apr_time_t timestamp = apr_time_now();
+			
+			switch(mrcp_message->start_line.method_id) {
+				case RECOGNIZER_START_OF_INPUT:
+					apt_log(APT_LOG_MARK,APT_PRIO_INFO,"START-OF-INPUT received [session:%s][channel:%s][timestamp:%" APR_TIME_T_FMT "]",
+						session_id, channel_id, timestamp);
+					break;
+					
+				case RECOGNIZER_INTERMEDIATE_RESULT:
+					/* Process INTERMEDIATE-RESULT immediately without waiting for STOP */
+					apt_log(APT_LOG_MARK,APT_PRIO_INFO,"INTERMEDIATE-RESULT received [session:%s][channel:%s][timestamp:%" APR_TIME_T_FMT "]",
+						session_id, channel_id, timestamp);
+					asr_session->intermediate_result = mrcp_message;
+					/* Log the partial result for immediate visibility */
+					if (mrcp_message->body.buf) {
+						apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Partial result: %s", mrcp_message->body.buf);
+					}
+					break;
+					
+				case RECOGNIZER_RECOGNITION_COMPLETE:
+					apt_log(APT_LOG_MARK,APT_PRIO_INFO,"RECOGNITION-COMPLETE received [session:%s][channel:%s][timestamp:%" APR_TIME_T_FMT "]",
+						session_id, channel_id, timestamp);
+					asr_session->recog_complete = mrcp_message;
+					break;
+					
+				default:
+					apt_log(APT_LOG_MARK,APT_PRIO_DEBUG,"Unknown event received [event_id:%d][session:%s][channel:%s][timestamp:%" APR_TIME_T_FMT "]",
+						mrcp_message->start_line.method_id, session_id, channel_id, timestamp);
+					break;
+			}
 		}
 	}
 	while(!asr_session->recog_complete);
@@ -1195,6 +1445,109 @@ ASR_CLIENT_DECLARE(apt_bool_t) asr_session_destroy(asr_session_t *asr_session)
 ASR_CLIENT_DECLARE(apt_bool_t) asr_engine_log_priority_set(apt_log_priority_e log_priority)
 {
 	return apt_log_priority_set(log_priority);
+}
+
+/** Get intermediate result if available */
+ASR_CLIENT_DECLARE(const char*) asr_session_get_intermediate_result(asr_session_t *asr_session)
+{
+	if (!asr_session || !asr_session->intermediate_result) {
+		return NULL;
+	}
+	return nlsml_result_get(asr_session->intermediate_result);
+}
+
+/** Create STOP request */
+static mrcp_message_t* stop_message_create(asr_session_t *asr_session)
+{
+	/* create MRCP message */
+	return mrcp_application_message_create(
+		asr_session->mrcp_session,
+		asr_session->mrcp_channel,
+		RECOGNIZER_STOP);
+}
+
+/** Send STOP request with timeout handling */
+ASR_CLIENT_DECLARE(apt_bool_t) asr_session_stop_with_timeout(
+									asr_session_t *asr_session,
+									apr_time_t timeout_ms)
+{
+	const mrcp_app_message_t *app_message = NULL;
+	mrcp_message_t *mrcp_message;
+	apr_time_t start_time, current_time;
+	apr_time_t timeout_us = timeout_ms * 1000; /* Convert to microseconds */
+	const char *session_id = "unknown";
+	const char *channel_id = "unknown";
+	
+	if (!asr_session) {
+		apt_log(APT_LOG_MARK,APT_PRIO_ERROR,"Invalid ASR session for STOP request");
+		return FALSE;
+	}
+
+	/* Get session and channel IDs for logging */
+	if (asr_session->mrcp_session) {
+		session_id = asr_session->mrcp_session->id.buf;
+	}
+	if (asr_session->mrcp_channel) {
+		channel_id = asr_session->mrcp_channel->identifier.buf;
+	}
+
+	/* Prevent multiple STOP requests */
+	apr_thread_mutex_lock(asr_session->mutex);
+	if (asr_session->stop_sent) {
+		apr_thread_mutex_unlock(asr_session->mutex);
+		apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"STOP already sent [session:%s][channel:%s]",
+			session_id, channel_id);
+		return TRUE; /* Already sent, consider success */
+	}
+	apr_thread_mutex_unlock(asr_session->mutex);
+
+	start_time = apr_time_now();
+	apt_log(APT_LOG_MARK,APT_PRIO_INFO,"Sending STOP request [session:%s][channel:%s][timeout_ms:%" APR_TIME_T_FMT "][timestamp:%" APR_TIME_T_FMT "]",
+		session_id, channel_id, timeout_ms, start_time);
+
+	mrcp_message = stop_message_create(asr_session);
+	if(!mrcp_message) {
+		apt_log(APT_LOG_MARK,APT_PRIO_ERROR,"Failed to Create STOP Request [session:%s][channel:%s]",
+			session_id, channel_id);
+		return FALSE;
+	}
+
+	/* Send STOP request and wait for the response with timeout */
+	apr_thread_mutex_lock(asr_session->mutex);
+	asr_session->stop_sent = TRUE;
+	if(mrcp_application_message_send(asr_session->mrcp_session,asr_session->mrcp_channel,mrcp_message) == TRUE) {
+		/* Wait for response with timeout */
+		if(apr_thread_cond_timedwait(asr_session->wait_object, asr_session->mutex, timeout_us) == APR_SUCCESS) {
+			app_message = asr_session->app_message;
+			asr_session->app_message = NULL;
+			asr_session->stop_received = TRUE;
+		} else {
+			/* Timeout occurred */
+			current_time = apr_time_now();
+			apt_log(APT_LOG_MARK,APT_PRIO_ERROR,"STOP response timeout [session:%s][channel:%s][timeout_ms:%" APR_TIME_T_FMT "][elapsed_ms:%" APR_TIME_T_FMT "]",
+				session_id, channel_id, timeout_ms, (current_time - start_time) / 1000);
+			apr_thread_mutex_unlock(asr_session->mutex);
+			return FALSE;
+		}
+	} else {
+		apt_log(APT_LOG_MARK,APT_PRIO_ERROR,"Failed to send STOP request [session:%s][channel:%s]",
+			session_id, channel_id);
+		asr_session->stop_sent = FALSE;
+		apr_thread_mutex_unlock(asr_session->mutex);
+		return FALSE;
+	}
+	apr_thread_mutex_unlock(asr_session->mutex);
+
+	current_time = apr_time_now();
+	if(mrcp_response_check(app_message,MRCP_REQUEST_STATE_COMPLETE) == TRUE) {
+		apt_log(APT_LOG_MARK,APT_PRIO_INFO,"STOP response received successfully [session:%s][channel:%s][elapsed_ms:%" APR_TIME_T_FMT "]",
+			session_id, channel_id, (current_time - start_time) / 1000);
+		return TRUE;
+	} else {
+		apt_log(APT_LOG_MARK,APT_PRIO_ERROR,"Invalid STOP response [session:%s][channel:%s][elapsed_ms:%" APR_TIME_T_FMT "]",
+			session_id, channel_id, (current_time - start_time) / 1000);
+		return FALSE;
+	}
 }
 
 

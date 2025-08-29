@@ -88,6 +88,14 @@ struct asr_session_t {
 	mrcp_channel_t           *mrcp_channel;
 	/** RECOGNITION-COMPLETE message  */
 	mrcp_message_t           *recog_complete;
+	/** INTERMEDIATE-RESULT message buffer */
+	mrcp_message_t           *intermediate_result;
+	/** STOP request sent flag */
+	apt_bool_t                stop_sent;
+	/** STOP response received flag */
+	apt_bool_t                stop_received;
+	/** Session is being destroyed */
+	apt_bool_t                destroying;
 
 	/** Input mode (either file or stream) */
 	input_mode_e              input_mode;
@@ -239,6 +247,21 @@ ASR_CLIENT_DECLARE(apt_bool_t) asr_session_file_recognize_send(
  * @param session the session to receive an event in the scope of
  */
 ASR_CLIENT_DECLARE(mrcp_recognizer_event_id) asr_session_file_recognize_receive(asr_session_t *session);
+
+/**
+ * Send STOP request with timeout handling.
+ * @param session the session to send STOP in the scope of
+ * @param timeout_ms timeout in milliseconds to wait for STOP response
+ */
+ASR_CLIENT_DECLARE(apt_bool_t) asr_session_stop_with_timeout(
+									asr_session_t *session,
+									apr_time_t timeout_ms);
+
+/**
+ * Get intermediate result if available.
+ * @param session the session to get intermediate result from
+ */
+ASR_CLIENT_DECLARE(const char*) asr_session_get_intermediate_result(asr_session_t *session);
 
 /**
  * Get NLSML instance.
