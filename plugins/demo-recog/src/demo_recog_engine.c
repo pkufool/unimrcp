@@ -147,6 +147,7 @@ struct demo_recog_channel_t {
   char                    *asr_backend_url;
   char                    *asr_backend_port;
   char                    *asr_backend_path;
+  apt_bool_t              input_finished;
   /** Audio buffering for WebSocket streaming */
   APR_RING_HEAD(demo_recog_audio_buffer_head_t, demo_recog_audio_buffer_t) audio_queue;
   apr_thread_mutex_t      *audio_queue_mutex;
@@ -202,11 +203,11 @@ MRCP_PLUGIN_DECLARE(mrcp_engine_t*) mrcp_plugin_create(apr_pool_t *pool)
   apt_task_msg_pool_t *msg_pool;
 
   /* Set default ASR backend configuration */
-  const char *asr_url = getenv("ASR_SERVER_URL");
+  const char *asr_url = getenv("ASR_SERVER_IP");
   if(asr_url) {
     demo_engine->asr_backend_url = apr_pstrdup(pool, asr_url);
   } else {
-    demo_engine->asr_backend_url = apr_pstrdup(pool, "localhost");
+    demo_engine->asr_backend_url = apr_pstrdup(pool, "127.0.0.1");
   }
   const char *asr_port = getenv("ASR_SERVER_PORT");
   if(asr_port) {
@@ -292,6 +293,7 @@ static mrcp_engine_channel_t* demo_recog_engine_channel_create(mrcp_engine_t *en
   recog_channel->ws_context = NULL;
   recog_channel->ws_connection = NULL;
   recog_channel->ws_connected = FALSE;
+  recog_channel->input_finished = FALSE;
   recog_channel->asr_backend_url = apr_pstrdup(pool, recog_channel->demo_engine->asr_backend_url);
   recog_channel->asr_backend_port = apr_pstrdup(pool, recog_channel->demo_engine->asr_backend_port);
   recog_channel->asr_backend_path = apr_pstrdup(pool, recog_channel->demo_engine->asr_backend_path);
@@ -395,6 +397,7 @@ static apt_bool_t demo_recog_channel_recognize(mrcp_engine_channel_t *channel, m
   recog_header = mrcp_resource_header_get(request);
   if(recog_header) {
     if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_START_INPUT_TIMERS) == TRUE) {
+      apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Received START_INPUT_TIMERS header");
       recog_channel->timers_started = recog_header->start_input_timers;
     }
     if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_NO_INPUT_TIMEOUT) == TRUE) {
@@ -446,6 +449,7 @@ static apt_bool_t demo_recog_channel_stop(mrcp_engine_channel_t *channel, mrcp_m
   demo_recog_channel_t *recog_channel = channel->method_obj;
   /* store STOP request, make sure there is no more activity and only then send the response */
   recog_channel->stop_response = response;
+  recog_channel->input_finished = TRUE;
   return TRUE;
 }
 
@@ -470,11 +474,13 @@ static apt_bool_t demo_recog_channel_request_dispatch(mrcp_engine_channel_t *cha
     case RECOGNIZER_DEFINE_GRAMMAR:
       break;
     case RECOGNIZER_RECOGNIZE:
+      apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Received RECOGNIZE event");
       processed = demo_recog_channel_recognize(channel,request,response);
       break;
     case RECOGNIZER_GET_RESULT:
       break;
     case RECOGNIZER_START_INPUT_TIMERS:
+      apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Received START_INPUT_TIMERS event");
       processed = demo_recog_channel_timers_start(channel,request,response);
       break;
     case RECOGNIZER_STOP:
@@ -536,7 +542,7 @@ static apt_bool_t demo_recog_result_load(demo_recog_channel_t *recog_channel, mr
   if(!file_path) {
     return FALSE;
   }
-  
+
   /* read the demo result from file */
   file = fopen(file_path,"r");
   if(file) {
@@ -559,7 +565,7 @@ static apt_bool_t demo_recog_result_load(demo_recog_channel_t *recog_channel, mr
 }
 
 /* Raise demo RECOGNITION-COMPLETE event */
-static apt_bool_t demo_recog_recognition_complete(demo_recog_channel_t *recog_channel, mrcp_recog_completion_cause_e cause)
+static apt_bool_t demo_recog_recognition_complete(demo_recog_channel_t *recog_channel, mrcp_recog_completion_cause_e cause, const char *result_text)
 {
   mrcp_recog_header_t *recog_header;
   /* create RECOGNITION-COMPLETE event */
@@ -582,7 +588,15 @@ static apt_bool_t demo_recog_recognition_complete(demo_recog_channel_t *recog_ch
   message->start_line.request_state = MRCP_REQUEST_STATE_COMPLETE;
 
   if(cause == RECOGNIZER_COMPLETION_CAUSE_SUCCESS) {
-    demo_recog_result_load(recog_channel,message);
+    apt_string_assign(&message->body, result_text, message->pool);
+
+    /* Set content type for the result */
+    mrcp_generic_header_t *generic_header = mrcp_generic_header_prepare(message);
+    if(generic_header) {
+      /* set content types */
+      apt_string_assign(&generic_header->content_type,"application/x-nlsml",message->pool);
+      mrcp_generic_header_property_add(message,GENERIC_HEADER_CONTENT_TYPE);
+    }
   }
 
   recog_channel->recog_request = NULL;
@@ -596,13 +610,13 @@ static apt_bool_t demo_recog_stream_write(mpf_audio_stream_t *stream, const mpf_
   demo_recog_channel_t *recog_channel = stream->obj;
   if(recog_channel->stop_response) {
     /* send asynchronous response to STOP request */
-    mrcp_engine_channel_message_send(recog_channel->channel,recog_channel->stop_response);
-    recog_channel->stop_response = NULL;
-    recog_channel->recog_request = NULL;
+    /*mrcp_engine_channel_message_send(recog_channel->channel,recog_channel->stop_response);*/
+    /*recog_channel->stop_response = NULL;*/
+    /*recog_channel->recog_request = NULL;*/
     return TRUE;
   }
 
-  if(recog_channel->recog_request) {
+  if(recog_channel->recog_request && !recog_channel->input_finished) {
     /*
     mpf_detector_event_e det_event = mpf_activity_detector_process(recog_channel->detector,frame);
     switch(det_event) {
@@ -786,6 +800,27 @@ static int demo_recog_ws_callback(struct lws *wsi, enum lws_callback_reasons rea
           }
           lws_callback_on_writable(wsi);
         } else {
+          if (recog_channel->input_finished) {
+            // 1. Create the JSON object
+            struct json_object *jobj = json_object_new_object();
+            json_object_object_add(jobj, "event", json_object_new_string("end"));
+
+            // 2. Serialize to string
+            const char *msg = json_object_to_json_string(jobj);
+
+            // 3. Send message over websocket
+            size_t msg_len = strlen(msg);
+            unsigned char buf[LWS_PRE + 1024];
+            unsigned char *p = &buf[LWS_PRE];
+
+            memcpy(p, msg, msg_len);
+
+            lws_write(wsi, p, msg_len, LWS_WRITE_TEXT);
+
+            // 4. Clean up
+            json_object_put(jobj);
+
+          }
           apr_thread_mutex_unlock(recog_channel->audio_queue_mutex);
         }
       }
@@ -885,9 +920,10 @@ static apt_bool_t demo_recog_process_asr_response(demo_recog_channel_t *recog_ch
     return FALSE;
   }
 
-  json_object *type_obj, *result_obj;
+  json_object *type_obj, *result_obj, *endpoint_obj;
   if(!json_object_object_get_ex(root, "type", &type_obj) ||
-     !json_object_object_get_ex(root, "text", &result_obj)) {
+     !json_object_object_get_ex(root, "text", &result_obj) ||
+     !json_object_object_get_ex(root, "endpoint", &endpoint_obj)) {
     apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, "Invalid ASR response format: %s", json_msg);
     json_object_put(root);
     return FALSE;
@@ -901,10 +937,17 @@ static apt_bool_t demo_recog_process_asr_response(demo_recog_channel_t *recog_ch
     demo_recog_intermediate_result(recog_channel, result_str);
   } else if(strcmp(type_str, "final") == 0) {
     /* Send RECOGNITION-COMPLETE event */
-    demo_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "RECEIVE Final.");
+    demo_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_SUCCESS, result_str);
+
+    if(recog_channel->stop_response) {
+        mrcp_engine_channel_message_send(recog_channel->channel,recog_channel->stop_response);
+        recog_channel->stop_response = NULL;
+    }
   }
 
   json_object_put(root);
+
   return TRUE;
 }
 
