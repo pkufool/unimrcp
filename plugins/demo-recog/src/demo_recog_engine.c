@@ -349,6 +349,23 @@ static apt_bool_t demo_recog_channel_destroy(mrcp_engine_channel_t *channel)
   return TRUE;
 }
 
+/*
+static void process_mrcp_channel(mrcp_engine_channel_t *channel) {
+    const mpf_stream_capabilities_t *capabilities = mrcp_application_audio_stream_capabilities_get(channel);
+    const mpf_stream_capability_t *audio_cap = mpf_stream_capabilities_find(capabilities, MPF_DIRECTION_RECV);
+    if(audio_cap) {
+        const mpf_codec_descriptor_t *codec = mpf_stream_capability_codec_descriptor_get(audio_cap, 0);
+        if(codec) {
+            apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Recevied audio format:\n");
+            apt_log(RECOG_LOG_MARK,APT_PRIO_INFO," Codec: %s\n", codec->name);
+            apt_log(RECOG_LOG_MARK,APT_PRIO_INFO," Sample Rate: %d\n", codec->sampling_rate);
+            apt_log(RECOG_LOG_MARK,APT_PRIO_INFO," Channels: %d\n", codec->channel_count);
+            // Set up decoder/processing according to these parameters
+        }
+    }
+}
+*/
+
 /** Open engine channel (asynchronous response MUST be sent)*/
 static apt_bool_t demo_recog_channel_open(mrcp_engine_channel_t *channel)
 {
@@ -361,6 +378,7 @@ static apt_bool_t demo_recog_channel_open(mrcp_engine_channel_t *channel)
       apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Attrib name [%s] value [%s]",entry[i].key,entry[i].val);
     }
   }
+  /*process_mrcp_channel(channel);*/
 
   return demo_recog_msg_signal(DEMO_RECOG_MSG_OPEN_CHANNEL,channel,NULL);
 }
@@ -564,6 +582,22 @@ static apt_bool_t demo_recog_result_load(demo_recog_channel_t *recog_channel, mr
   return TRUE;
 }
 
+static void write_nlsml_result(const char* recognized_text, char* buffer, size_t buflen)
+{
+    // Format NLSML string
+    snprintf(buffer, buflen,
+        "<?xml version=\"1.0\"?>\n"
+        "<nlsml xmlns=\"http://www.w3.org/2001/06/grammar\">\n"
+        "  <result>\n"
+        "    <interpretation>\n"
+        "      <input mode=\"speech\">%s</input>\n"
+        "    </interpretation>\n"
+        "  </result>\n"
+        "</nlsml>\n",
+        recognized_text ? recognized_text : ""
+    );
+}
+
 /* Raise demo RECOGNITION-COMPLETE event */
 static apt_bool_t demo_recog_recognition_complete(demo_recog_channel_t *recog_channel, mrcp_recog_completion_cause_e cause, const char *result_text)
 {
@@ -588,7 +622,13 @@ static apt_bool_t demo_recog_recognition_complete(demo_recog_channel_t *recog_ch
   message->start_line.request_state = MRCP_REQUEST_STATE_COMPLETE;
 
   if(cause == RECOGNIZER_COMPLETION_CAUSE_SUCCESS) {
-    apt_string_assign(&message->body, result_text, message->pool);
+    int32_t result_text_len = result_text ? (int32_t)strlen(result_text) : 0;
+    char nlsml_result[256 + result_text_len];
+    write_nlsml_result(result_text, nlsml_result, sizeof(nlsml_result));
+    apt_string_assign(&message->body, nlsml_result, message->pool);
+
+    apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Compelet result : %s\n", nlsml_result);
+
 
     /* Set content type for the result */
     mrcp_generic_header_t *generic_header = mrcp_generic_header_prepare(message);
@@ -969,12 +1009,15 @@ static apt_bool_t demo_recog_intermediate_result(demo_recog_channel_t *recog_cha
 
   /* Set the result text as message body */
   if(result_text && strlen(result_text) > 0) {
-    apt_string_assign(&message->body, result_text, message->pool);
+    int32_t result_text_len = result_text ? (int32_t)strlen(result_text) : 0;
+    char nlsml_result[256 + result_text_len];
+    write_nlsml_result(result_text, nlsml_result, sizeof(nlsml_result));
+    apt_string_assign(&message->body, nlsml_result, message->pool);
 
     /* Set content type for the result */
     mrcp_generic_header_t *generic_header = mrcp_generic_header_prepare(message);
     if(generic_header) {
-      apt_string_assign(&generic_header->content_type, "text/plain", message->pool);
+      apt_string_assign(&generic_header->content_type, "application/x-nlsml", message->pool);
       mrcp_generic_header_property_add(message, GENERIC_HEADER_CONTENT_TYPE);
     }
   }
