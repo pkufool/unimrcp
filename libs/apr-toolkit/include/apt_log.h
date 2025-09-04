@@ -103,7 +103,8 @@ typedef enum {
 	APT_LOG_HEADER_MARK     = 0x08, /**< enable file:line mark output */
 	APT_LOG_HEADER_THREAD   = 0x10, /**< enable thread identifier output */
 
-	APT_LOG_HEADER_DEFAULT  = APT_LOG_HEADER_DATE | APT_LOG_HEADER_TIME | APT_LOG_HEADER_PRIORITY
+	APT_LOG_HEADER_DEFAULT  = APT_LOG_HEADER_DATE | APT_LOG_HEADER_TIME | APT_LOG_HEADER_PRIORITY,
+	APT_LOG_HEADER_ENHANCED = APT_LOG_HEADER_DATE | APT_LOG_HEADER_TIME | APT_LOG_HEADER_PRIORITY | APT_LOG_HEADER_MARK
 } apt_log_header_e;
 
 /** Mode of log output */
@@ -261,6 +262,13 @@ APT_DECLARE(apt_bool_t) apt_log_header_set(int header);
 APT_DECLARE(int) apt_log_header_translate(char *str);
 
 /**
+ * Enable enhanced logging mode which includes source file and line number information.
+ * This is a convenience function that sets the headers to include MARK information.
+ * @return TRUE on success, FALSE on failure
+ */
+APT_DECLARE(apt_bool_t) apt_log_enhanced_mode_enable(void);
+
+/**
  * Set the masking mode of private data.
  * @param masking the masking mode to set
  */
@@ -325,6 +333,107 @@ APT_DECLARE(apt_bool_t) apt_obj_log(apt_log_source_t *log_source, const char *fi
  * @param arg_ptr the arguments
  */
 APT_DECLARE(apt_bool_t) apt_va_log(apt_log_source_t *log_source, const char *file, int line, apt_log_priority_e priority, const char *format, va_list arg_ptr);
+
+/*
+ * ========================================================================
+ * Enhanced Logging Convenience Macros
+ * ========================================================================
+ * 
+ * These macros provide a simplified interface for logging that automatically
+ * captures source file and line number information. They eliminate the need
+ * to manually specify __FILE__ and __LINE__ in every log call.
+ * 
+ * Basic Usage:
+ *   apt_log_debug("Debug message");
+ *   apt_log_info("Process started with PID %d", pid);
+ *   apt_log_error("Failed to open file: %s", filename);
+ * 
+ * To enable file/line information in log output, call:
+ *   apt_log_enhanced_mode_enable();
+ * 
+ * Or manually set headers:
+ *   apt_log_header_set(APT_LOG_HEADER_ENHANCED);
+ * 
+ * Benefits:
+ * - Automatic capture of source location (__FILE__ and __LINE__)
+ * - Consistent logging interface across the codebase
+ * - Reduced boilerplate code in log statements
+ * - Easy debugging and troubleshooting with precise location info
+ * 
+ * The macros come in two variants:
+ * 1. Basic: apt_log_xxx() - Uses default log source
+ * 2. Extended: apt_log_src_xxx() - Accepts custom log source as first parameter
+ * ========================================================================
+ */
+
+/** Log an emergency message with automatic file and line information */
+#define apt_log_emergency(format, ...) \
+	apt_log(&def_log_source, __FILE__, __LINE__, APT_PRIO_EMERGENCY, format, ##__VA_ARGS__)
+
+/** Log an alert message with automatic file and line information */
+#define apt_log_alert(format, ...) \
+	apt_log(&def_log_source, __FILE__, __LINE__, APT_PRIO_ALERT, format, ##__VA_ARGS__)
+
+/** Log a critical message with automatic file and line information */
+#define apt_log_critical(format, ...) \
+	apt_log(&def_log_source, __FILE__, __LINE__, APT_PRIO_CRITICAL, format, ##__VA_ARGS__)
+
+/** Log an error message with automatic file and line information */
+#define apt_log_error(format, ...) \
+	apt_log(&def_log_source, __FILE__, __LINE__, APT_PRIO_ERROR, format, ##__VA_ARGS__)
+
+/** Log a warning message with automatic file and line information */
+#define apt_log_warning(format, ...) \
+	apt_log(&def_log_source, __FILE__, __LINE__, APT_PRIO_WARNING, format, ##__VA_ARGS__)
+
+/** Log a notice message with automatic file and line information */
+#define apt_log_notice(format, ...) \
+	apt_log(&def_log_source, __FILE__, __LINE__, APT_PRIO_NOTICE, format, ##__VA_ARGS__)
+
+/** Log an info message with automatic file and line information */
+#define apt_log_info(format, ...) \
+	apt_log(&def_log_source, __FILE__, __LINE__, APT_PRIO_INFO, format, ##__VA_ARGS__)
+
+/** Log a debug message with automatic file and line information */
+#define apt_log_debug(format, ...) \
+	apt_log(&def_log_source, __FILE__, __LINE__, APT_PRIO_DEBUG, format, ##__VA_ARGS__)
+
+/*
+ * Enhanced logging macros that accept a custom log source and automatically include 
+ * source file and line number information.
+ */
+
+/** Log an emergency message with custom source and automatic file and line information */
+#define apt_log_src_emergency(log_source, format, ...) \
+	apt_log(log_source, __FILE__, __LINE__, APT_PRIO_EMERGENCY, format, ##__VA_ARGS__)
+
+/** Log an alert message with custom source and automatic file and line information */
+#define apt_log_src_alert(log_source, format, ...) \
+	apt_log(log_source, __FILE__, __LINE__, APT_PRIO_ALERT, format, ##__VA_ARGS__)
+
+/** Log a critical message with custom source and automatic file and line information */
+#define apt_log_src_critical(log_source, format, ...) \
+	apt_log(log_source, __FILE__, __LINE__, APT_PRIO_CRITICAL, format, ##__VA_ARGS__)
+
+/** Log an error message with custom source and automatic file and line information */
+#define apt_log_src_error(log_source, format, ...) \
+	apt_log(log_source, __FILE__, __LINE__, APT_PRIO_ERROR, format, ##__VA_ARGS__)
+
+/** Log a warning message with custom source and automatic file and line information */
+#define apt_log_src_warning(log_source, format, ...) \
+	apt_log(log_source, __FILE__, __LINE__, APT_PRIO_WARNING, format, ##__VA_ARGS__)
+
+/** Log a notice message with custom source and automatic file and line information */
+#define apt_log_src_notice(log_source, format, ...) \
+	apt_log(log_source, __FILE__, __LINE__, APT_PRIO_NOTICE, format, ##__VA_ARGS__)
+
+/** Log an info message with custom source and automatic file and line information */
+#define apt_log_src_info(log_source, format, ...) \
+	apt_log(log_source, __FILE__, __LINE__, APT_PRIO_INFO, format, ##__VA_ARGS__)
+
+/** Log a debug message with custom source and automatic file and line information */
+#define apt_log_src_debug(log_source, format, ...) \
+	apt_log(log_source, __FILE__, __LINE__, APT_PRIO_DEBUG, format, ##__VA_ARGS__)
 
 APT_END_EXTERN_C
 
