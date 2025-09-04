@@ -719,6 +719,15 @@ APT_DECLARE(int) apt_log_header_translate(char *str)
 	return header;
 }
 
+APT_DECLARE(apt_bool_t) apt_log_enhanced_mode_enable(void)
+{
+	if(!apt_logger) {
+		return FALSE;
+	}
+	apt_logger->header = APT_LOG_HEADER_ENHANCED;
+	return TRUE;
+}
+
 APT_DECLARE(apt_bool_t) apt_log_masking_set(apt_log_masking_e masking)
 {
 	if(!apt_logger) {
@@ -861,7 +870,11 @@ static apt_bool_t apt_do_log(apt_log_source_t *log_source, const char *file, int
 							result.tm_usec);
 	}
 	if(apt_logger->header & APT_LOG_HEADER_MARK) {
-		offset += apr_snprintf(log_entry+offset,max_size-offset,"%s:%03d ",file,line);
+		/* Extract just the basename from the file path for cleaner output */
+		const char *basename = strrchr(file, '/');
+		if (!basename) basename = strrchr(file, '\\'); /* Windows path separator */
+		if (basename) basename++; else basename = file;
+		offset += apr_snprintf(log_entry+offset,max_size-offset,"%s:%03d ",basename,line);
 	}
 	if(apt_logger->header & APT_LOG_HEADER_THREAD) {
 		offset += apr_snprintf(log_entry+offset,max_size-offset,"%05lu ",apt_thread_id_get());
