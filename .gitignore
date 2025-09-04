@@ -17,6 +17,7 @@
 /Debug
 /Release
 /x64
+/build
 /*.ncb
 /*.suo
 /*.sdf
