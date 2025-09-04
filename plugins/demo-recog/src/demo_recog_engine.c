@@ -41,6 +41,7 @@
 #include "mpf_activity_detector.h"
 #include "apt_consumer_task.h"
 #include "apt_log.h"
+#include "mrcp_engine_impl.h"
 #include <libwebsockets.h>
 #include <json-c/json.h>
 #include <string.h>
@@ -648,6 +649,20 @@ static apt_bool_t demo_recog_recognition_complete(demo_recog_channel_t *recog_ch
 static apt_bool_t demo_recog_stream_write(mpf_audio_stream_t *stream, const mpf_frame_t *frame)
 {
   demo_recog_channel_t *recog_channel = stream->obj;
+
+  /* Get codec descriptor */
+  const mpf_codec_descriptor_t *descriptor = mrcp_engine_sink_stream_codec_get(
+      recog_channel->channel);
+  /*
+  if(descriptor) {
+      apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Audio Codec: %s, Rate: %d, Channels: %d, payload type: %d",
+          descriptor->name.buf,
+          descriptor->sampling_rate,
+          descriptor->channel_count,
+          descriptor->payload_type);
+  }
+  */
+
   if(recog_channel->stop_response) {
     /* send asynchronous response to STOP request */
     /*mrcp_engine_channel_message_send(recog_channel->channel,recog_channel->stop_response);*/
@@ -792,6 +807,13 @@ static int demo_recog_ws_callback(struct lws *wsi, enum lws_callback_reasons rea
       if(recog_channel) {
         recog_channel->ws_connected = TRUE;
       }
+      char json_str[128];
+      snprintf(json_str, sizeof(json_str), "{\"sample_rate\":%d}", 8000);
+
+      unsigned char buf[LWS_PRE + 128];
+      size_t len = strlen(json_str);
+      memcpy(&buf[LWS_PRE], json_str, len);
+      lws_write(wsi, &buf[LWS_PRE], len, LWS_WRITE_TEXT);
       break;
 
     case LWS_CALLBACK_CLIENT_RECEIVE:
