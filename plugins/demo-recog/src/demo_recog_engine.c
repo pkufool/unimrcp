@@ -804,16 +804,24 @@ static int demo_recog_ws_callback(struct lws *wsi, enum lws_callback_reasons rea
   switch (reason) {
     case LWS_CALLBACK_CLIENT_ESTABLISHED:
       apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "WebSocket connection established");
+
       if(recog_channel) {
         recog_channel->ws_connected = TRUE;
-      }
-      char json_str[128];
-      snprintf(json_str, sizeof(json_str), "{\"sample_rate\":%d}", 8000);
+        json_object *jobj = json_object_new_object();
+        json_object_object_add(jobj, "event", json_object_new_string("start"));
+        json_object_object_add(jobj, "sample_rate", json_object_new_int(8000));
 
-      unsigned char buf[LWS_PRE + 128];
-      size_t len = strlen(json_str);
-      memcpy(&buf[LWS_PRE], json_str, len);
-      lws_write(wsi, &buf[LWS_PRE], len, LWS_WRITE_TEXT);
+        // Convert to string
+        const char *json_str = json_object_to_json_string(jobj);
+        unsigned char buf[LWS_PRE + 1024];
+        size_t len = strlen(json_str);
+        memcpy(&buf[LWS_PRE], json_str, len);
+        lws_write(wsi, &buf[LWS_PRE], len, LWS_WRITE_TEXT);
+        apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Sent start message: %s", json_str);
+        // Clean up
+        json_object_put(jobj);
+
+      }
       break;
 
     case LWS_CALLBACK_CLIENT_RECEIVE:
@@ -878,6 +886,8 @@ static int demo_recog_ws_callback(struct lws *wsi, enum lws_callback_reasons rea
             memcpy(p, msg, msg_len);
 
             lws_write(wsi, p, msg_len, LWS_WRITE_TEXT);
+
+            apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Sent end message: %s", msg);
 
             // 4. Clean up
             json_object_put(jobj);
@@ -954,7 +964,7 @@ static apt_bool_t demo_recog_ws_disconnect(demo_recog_channel_t *recog_channel)
 /** Send audio data to WebSocket */
 static apt_bool_t demo_recog_ws_send_audio(demo_recog_channel_t *recog_channel, const void *data, apr_size_t size)
 {
-  if(!recog_channel->ws_connected || !recog_channel->ws_connection) {
+  if(!recog_channel->ws_connection) {
     return FALSE;
   }
 
