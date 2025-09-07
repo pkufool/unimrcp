@@ -7,7 +7,8 @@
     SYSLOG        syslog output
     CONSOLE,FILE  both console and the log file output
   -->
-  <output>CONSOLE</output>
+  <output>FILE</output>
+  <file>log/unimrcpserver.log</file>
 
   <!--  Set the format of the log messages
     DATE          date output

@@ -9,7 +9,7 @@
       If the attribute "type" is set to "auto", IP address is determined implicitly by the hostname.
       This is the default setting.
     -->
-    <ip type="auto"/>
+    <!--<ip type="auto"/>-->
 
     <!--
       If the attribute "type" is set to "iface", IP address is determined by the specified name of
@@ -20,7 +20,7 @@
     <!--
       IP address can also be specified explicitly.
     -->
-    <!-- <ip>10.10.0.1</ip> -->
+    <ip>0.0.0.0</ip>
 
     <!-- <ext-ip>a.b.c.d</ext-ip> -->
 

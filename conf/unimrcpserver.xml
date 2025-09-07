@@ -8,7 +8,7 @@
       If the attribute "type" is set to "auto", IP address is determined implicitly by the hostname.
       This is the default setting.
     -->
-    <ip type="auto"/>
+    <!--<ip type="auto"/>-->
 
     <!--
       If the attribute "type" is set to "iface", IP address is determined by the specified name of
@@ -19,7 +19,7 @@
     <!--
       IP address can also be specified explicitly.
     -->
-    <!-- <ip>10.10.0.1</ip> -->
+    <ip>0.0.0.0</ip>
 
     <!-- <ext-ip>a.b.c.d</ext-ip> -->
   </properties>
@@ -38,11 +38,11 @@
       <!--
         By default, "ip" and "ext-ip" addresses, set in the properties, are used. These parameters can
         explicitly be specified per "sip-uas" by means of "sip-ip" and "sip-ext-ip" correspondingly.
+      <sip-ip>0.0.0.0</sip-ip>
       -->
-      <!-- <sip-ip>10.10.0.1</sip-ip> -->
       <!-- <sip-ext-ip>a.b.c.d</sip-ext-ip> -->
       <sip-port>8060</sip-port>
-      <sip-transport>udp,tcp</sip-transport>
+      <sip-transport>tcp,udp</sip-transport>
       <!-- <force-destination>true</force-destination> -->
       <!--
         This parameter can be used to disable the Sofia SIP SDP Offer/Answer Engine Module (soa).
@@ -115,8 +115,8 @@
       -->
       <!-- <rtp-ip>10.10.0.1</rtp-ip> -->
       <!-- <rtp-ext-ip>a.b.c.d</rtp-ext-ip> -->
-      <rtp-port-min>5000</rtp-port-min>
-      <rtp-port-max>6000</rtp-port-max>
+      <rtp-port-min>7000</rtp-port-min>
+      <rtp-port-max>7050</rtp-port-max>
     </rtp-factory>
 
     <!-- Factory of plugins (MRCP engines) -->
