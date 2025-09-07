@@ -116,6 +116,10 @@ struct demo_recog_engine_t {
   char                   *asr_backend_url;
   char                   *asr_backend_port;
   char                   *asr_backend_path;
+
+  struct lws_context     *ws_context;         // shared context for all channels
+  pthread_t              ws_service_thread;   // single thread for lws_service
+  volatile int           ws_running;          // flag to stop the service thread
 };
 
 /** Declaration of demo recognizer channel */
@@ -136,10 +140,6 @@ struct demo_recog_channel_t {
   /** File to write utterance to */
   FILE                    *audio_out;
 
-  pthread_t thread;
-
-  /** WebSocket connection context */
-  struct lws_context      *ws_context;
   /** WebSocket connection instance */
   struct lws              *ws_connection;
   /** WebSocket connection state */
@@ -223,6 +223,9 @@ MRCP_PLUGIN_DECLARE(mrcp_engine_t*) mrcp_plugin_create(apr_pool_t *pool)
     demo_engine->asr_backend_path = apr_pstrdup(pool, "/");
   }
 
+  demo_engine->ws_context = NULL;
+  demo_engine->ws_running = 0;
+
   msg_pool = apt_task_msg_pool_create_dynamic(sizeof(demo_recog_msg_t),pool);
   demo_engine->task = apt_consumer_task_create(demo_engine,msg_pool,pool);
   if(!demo_engine->task) {
@@ -252,7 +255,37 @@ static apt_bool_t demo_recog_engine_destroy(mrcp_engine_t *engine)
     apt_task_destroy(task);
     demo_engine->task = NULL;
   }
+  /* Stop websocket service thread */
+  if (demo_engine->ws_running) {
+    demo_engine->ws_running = 0;
+    pthread_join(demo_engine->ws_service_thread, NULL);
+  }
+  if (demo_engine->ws_context) {
+    lws_context_destroy(demo_engine->ws_context);
+    demo_engine->ws_context = NULL;
+  }
   return TRUE;
+}
+
+/* WebSocket protocols */
+static const char *ws_protocol_name = "asr-protocol";
+static struct lws_protocols protocols[] = {
+  {
+    .name = "asr-protocol",
+    .callback = demo_recog_ws_callback,
+    .per_session_data_size = sizeof(demo_recog_channel_t),
+    .rx_buffer_size = 4096,
+  },
+  { NULL, NULL, 0, 0 } /* terminator */
+};
+
+/** WebSocket service thread shared for all channels */
+static void *ws_asr_service_thread(void *arg) {
+  demo_recog_engine_t *engine = (demo_recog_engine_t *)arg;
+  while (engine->ws_running) {
+    lws_service(engine->ws_context, 50);
+  }
+  return NULL;
 }
 
 /** Open recognizer engine */
@@ -263,6 +296,22 @@ static apt_bool_t demo_recog_engine_open(mrcp_engine_t *engine)
     apt_task_t *task = apt_consumer_task_base_get(demo_engine->task);
     apt_task_start(task);
   }
+
+  /* Create shared websocket context */
+  struct lws_context_creation_info info;
+  memset(&info, 0, sizeof(info));
+  info.port = CONTEXT_PORT_NO_LISTEN;
+  info.protocols = protocols;
+  demo_engine->ws_context = lws_create_context(&info);
+  if (!demo_engine->ws_context) {
+    apt_log(RECOG_LOG_MARK, APT_PRIO_ERROR, "Failed to create WebSocket context");
+    return mrcp_engine_open_respond(engine, FALSE);
+  }
+
+  /* Start websocket service thread */
+  demo_engine->ws_running = 1;
+  pthread_create(&demo_engine->ws_service_thread, NULL, ws_asr_service_thread, demo_engine);
+
   return mrcp_engine_open_respond(engine,TRUE);
 }
 
@@ -274,6 +323,17 @@ static apt_bool_t demo_recog_engine_close(mrcp_engine_t *engine)
     apt_task_t *task = apt_consumer_task_base_get(demo_engine->task);
     apt_task_terminate(task,TRUE);
   }
+
+  /* Stop websocket service thread */
+  if (demo_engine->ws_running) {
+    demo_engine->ws_running = 0;
+    pthread_join(demo_engine->ws_service_thread, NULL);
+  }
+  if (demo_engine->ws_context) {
+    lws_context_destroy(demo_engine->ws_context);
+    demo_engine->ws_context = NULL;
+  }
+
   return mrcp_engine_close_respond(engine);
 }
 
@@ -291,7 +351,6 @@ static mrcp_engine_channel_t* demo_recog_engine_channel_create(mrcp_engine_t *en
   recog_channel->audio_out = NULL;
 
   /* Initialize WebSocket fields */
-  recog_channel->ws_context = NULL;
   recog_channel->ws_connection = NULL;
   recog_channel->ws_connected = FALSE;
   recog_channel->input_finished = FALSE;
@@ -349,23 +408,6 @@ static apt_bool_t demo_recog_channel_destroy(mrcp_engine_channel_t *channel)
 
   return TRUE;
 }
-
-/*
-static void process_mrcp_channel(mrcp_engine_channel_t *channel) {
-    const mpf_stream_capabilities_t *capabilities = mrcp_application_audio_stream_capabilities_get(channel);
-    const mpf_stream_capability_t *audio_cap = mpf_stream_capabilities_find(capabilities, MPF_DIRECTION_RECV);
-    if(audio_cap) {
-        const mpf_codec_descriptor_t *codec = mpf_stream_capability_codec_descriptor_get(audio_cap, 0);
-        if(codec) {
-            apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Recevied audio format:\n");
-            apt_log(RECOG_LOG_MARK,APT_PRIO_INFO," Codec: %s\n", codec->name);
-            apt_log(RECOG_LOG_MARK,APT_PRIO_INFO," Sample Rate: %d\n", codec->sampling_rate);
-            apt_log(RECOG_LOG_MARK,APT_PRIO_INFO," Channels: %d\n", codec->channel_count);
-            // Set up decoder/processing according to these parameters
-        }
-    }
-}
-*/
 
 /** Open engine channel (asynchronous response MUST be sent)*/
 static apt_bool_t demo_recog_channel_open(mrcp_engine_channel_t *channel)
@@ -774,32 +816,10 @@ static apt_bool_t demo_recog_msg_process(apt_task_t *task, apt_task_msg_t *msg)
   return TRUE;
 }
 
-/* WebSocket protocols */
-static const char *ws_protocol_name = "asr-protocol";
-static struct lws_protocols protocols[] = {
-  {
-    .name = "asr-protocol",
-    .callback = demo_recog_ws_callback,
-    .per_session_data_size = sizeof(demo_recog_channel_t*),
-    .rx_buffer_size = 4096,
-  },
-  { NULL, NULL, 0, 0 } /* terminator */
-};
-
-/* --- WebSocket service thread --- */
-static void *ws_asr_service_thread(void *arg) {
-  demo_recog_channel_t *client = (demo_recog_channel_t *)arg;
-  while (TRUE) {
-    lws_service(client->ws_context, 50);
-  }
-  return NULL;
-}
-
 /** WebSocket callback function */
 static int demo_recog_ws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len)
 {
-  demo_recog_channel_t **channel_ptr = (demo_recog_channel_t**)user;
-  demo_recog_channel_t *recog_channel = (channel_ptr && *channel_ptr) ? *channel_ptr : NULL;
+  demo_recog_channel_t *recog_channel = (demo_recog_channel_t *)user;
 
   switch (reason) {
     case LWS_CALLBACK_CLIENT_ESTABLISHED:
@@ -863,7 +883,6 @@ static int demo_recog_ws_callback(struct lws *wsi, enum lws_callback_reasons rea
           int ret = lws_write(wsi, buf + LWS_PRE, num_samples * sizeof(float),
                     LWS_WRITE_BINARY);
 
-          /*int ret = lws_write(wsi, (unsigned char*)buffer->data, buffer->size, LWS_WRITE_BINARY);*/
           if (ret < 0) {
             apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, "Failed to write audio data to WebSocket");
             return -1;
@@ -908,39 +927,24 @@ static int demo_recog_ws_callback(struct lws *wsi, enum lws_callback_reasons rea
 /** Establish WebSocket connection to ASR backend */
 static apt_bool_t demo_recog_ws_connect(demo_recog_channel_t *recog_channel)
 {
-
-  struct lws_context_creation_info info;
+  demo_recog_engine_t *engine = recog_channel->demo_engine;
   struct lws_client_connect_info connect_info;
 
-  memset(&info, 0, sizeof(info));
-  info.port = CONTEXT_PORT_NO_LISTEN;  
-  info.protocols = protocols;
-
-  recog_channel->ws_context = lws_create_context(&info);
-  if(!recog_channel->ws_context) {
-    apt_log(RECOG_LOG_MARK, APT_PRIO_ERROR, "Failed to create WebSocket context");
-    return FALSE;
-  }
-
   memset(&connect_info, 0, sizeof(connect_info));
-  connect_info.context = recog_channel->ws_context;
+  connect_info.context = engine->ws_context;
   connect_info.address = recog_channel->asr_backend_url;
   connect_info.port = atoi(recog_channel->asr_backend_port);
   connect_info.path = recog_channel->asr_backend_path;
   connect_info.host = recog_channel->asr_backend_url;
   connect_info.origin = recog_channel->asr_backend_url;
   connect_info.protocol = ws_protocol_name;
-  connect_info.userdata = &recog_channel;
+  connect_info.userdata = recog_channel;
 
   recog_channel->ws_connection = lws_client_connect_via_info(&connect_info);
   if(!recog_channel->ws_connection) {
     apt_log(RECOG_LOG_MARK, APT_PRIO_ERROR, "Failed to initiate WebSocket connection");
-    lws_context_destroy(recog_channel->ws_context);
-    recog_channel->ws_context = NULL;
     return FALSE;
   }
-
-  pthread_create(&recog_channel->thread, NULL, ws_asr_service_thread, recog_channel);
   return TRUE;
 }
 
@@ -950,11 +954,6 @@ static apt_bool_t demo_recog_ws_disconnect(demo_recog_channel_t *recog_channel)
   if(recog_channel->ws_connection) {
     lws_close_reason(recog_channel->ws_connection, LWS_CLOSE_STATUS_NORMAL, "recognition complete", 0);
     recog_channel->ws_connection = NULL;
-  }
-
-  if(recog_channel->ws_context) {
-    lws_context_destroy(recog_channel->ws_context);
-    recog_channel->ws_context = NULL;
   }
 
   recog_channel->ws_connected = FALSE;
